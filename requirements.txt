@@ -1,0 +1,4 @@
+# Root-level requirements — used by generate_data.py (Phase 1)
+faker==24.11.0
+pandas==2.2.2
+numpy==1.26.4

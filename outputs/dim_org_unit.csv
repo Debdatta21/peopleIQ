@@ -1,0 +1,21 @@
+org_unit_id,org_unit_name,parent_org_unit_id,org_level,company_id
+1,Corporate Services,,1,1
+2,Human Resources,1.0,2,1
+3,Finance & Accounting,1.0,2,1
+4,Information Technology,1.0,2,1
+5,HR Operations Team,2.0,3,1
+6,Talent Acquisition Team,2.0,3,1
+7,Financial Planning Team,3.0,3,1
+8,Accounting Team,3.0,3,1
+9,IT Infrastructure Team,4.0,3,1
+10,Software Development Team,4.0,3,1
+11,Field Operations,,1,1
+12,Site Operations - East,11.0,2,1
+13,Site Operations - West,11.0,2,1
+14,Site Operations - Central,11.0,2,1
+15,Operations Support,11.0,2,1
+16,East Region Alpha Team,12.0,3,1
+17,East Region Beta Team,12.0,3,1
+18,Revenue & Growth,,1,1
+19,Sales & Business Dev,18.0,2,1
+20,Marketing & Communications,18.0,2,1

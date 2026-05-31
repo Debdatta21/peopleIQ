@@ -1,0 +1,33 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --teal:        #0D7377;
+  --teal-dark:   #0a5c60;
+  --teal-light:  #e6f4f5;
+  --teal-border: #b3dfe1;
+  --text-primary:   #111827;
+  --text-secondary: #6b7280;
+  --text-muted:     #9ca3af;
+  --bg:          #ffffff;
+  --bg-subtle:   #f9fafb;
+  --border:      #e5e7eb;
+  --radius:      10px;
+  --shadow-sm:   0 1px 3px rgba(0,0,0,.08);
+  --shadow-md:   0 4px 16px rgba(0,0,0,.10);
+}
+
+html, body {
+  height: 100%;
+}
+
+body {
+  font-family: 'Inter', Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text-primary);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}

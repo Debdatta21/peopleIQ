@@ -1,0 +1,34 @@
+# Environment variables — never commit
+.env
+.env.local
+.env.production
+*.env
+
+# Database files — generated locally, not version controlled
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Sensitive outputs
+outputs/*.db
