@@ -1,18 +1,12 @@
 """
-PeopleIQ Phase 2 — FastAPI Backend (Gemini edition)
-====================================================
+PeopleIQ Phase 2 — FastAPI Backend (Groq edition)
+==================================================
 Single endpoint: POST /chat
   Input:  { "question": "string" }
   Output: { "answer": "string", "sql": "string|null", "row_count": int }
 
-Architecture (four functions, called in order):
-  1. generate_sql()    — question + schema → SQL (via Gemini API)
-  2. validate_sql()    — read-only safety check before execution
-  3. execute_query()   — SQL → result rows (PII stripped before return)
-  4. generate_answer() — result rows + question → plain-English answer (via Gemini API)
-
-Retry logic: on execute_query() failure, error is fed back into generate_sql()
-and retried up to MAX_RETRIES times. On third failure a graceful fallback is returned.
+Uses Groq free tier (llama-3.3-70b-versatile) for Text-to-SQL and answer generation.
+No private or real employee data is used. All data is synthetic.
 """
 
 import os
@@ -21,7 +15,7 @@ import sqlite3
 import logging
 from typing import Optional
 
-import google.generativeai as genai
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -32,10 +26,12 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("peopleiq")
 
-# ── Config ───────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# ── Config ────────────────────────────────────────────────────────────────────
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+MODEL = "llama-3.3-70b-versatile"
+MAX_RETRIES = 3
 
-# DB path: ../outputs/peopleiq_dev.db relative to this file
 DB_PATH = os.getenv(
     "PEOPLEIQ_DB_PATH",
     os.path.join(
@@ -45,23 +41,17 @@ DB_PATH = os.getenv(
     ),
 )
 
-MODEL = "gemini-2.0-flash"   # Free tier — 1,500 req/day, 1M tokens/min
-MAX_RETRIES = 3
-
-# PII column names — stripped from all result sets before they touch the LLM
 PII_COLUMNS = {"full_name", "email", "first_name", "last_name"}
 
-# ── Schema extraction (runs once at startup) ──────────────────────────────────
+# ── Schema extraction ─────────────────────────────────────────────────────────
 def _extract_schema_ddl() -> str:
-    """Pull CREATE TABLE statements from SQLite and return as a single string."""
     if not os.path.exists(DB_PATH):
         log.warning(f"Database not found at {DB_PATH}. Run generate_data.py first.")
         return ""
     con = sqlite3.connect(DB_PATH)
     cur = con.execute(
         "SELECT name, sql FROM sqlite_master "
-        "WHERE type='table' AND sql IS NOT NULL "
-        "ORDER BY name"
+        "WHERE type='table' AND sql IS NOT NULL ORDER BY name"
     )
     rows = cur.fetchall()
     con.close()
@@ -100,8 +90,7 @@ Key query patterns:
 
 ANSWER_SYSTEM_PROMPT = (
     "You are PeopleIQ, a friendly workforce analytics assistant. "
-    "Your job is to turn SQL query results into clear, concise answers "
-    "written for a non-technical HR audience. Follow these rules:\n"
+    "Turn SQL query results into clear, concise answers for a non-technical HR audience.\n"
     "- Write in complete sentences. Use plain English.\n"
     "- Never use SQL, column names, or technical jargon.\n"
     "- Be specific with numbers. Round percentages to one decimal place.\n"
@@ -110,33 +99,43 @@ ANSWER_SYSTEM_PROMPT = (
     "- Do not mention employee names under any circumstances."
 )
 
-# ── Gemini client ─────────────────────────────────────────────────────────────
-def _get_model(system_prompt: str) -> genai.GenerativeModel:
-    if not GEMINI_API_KEY:
+# ── Groq API call ─────────────────────────────────────────────────────────────
+def call_groq(system_prompt: str, user_content: str) -> str:
+    if not GROQ_API_KEY:
         raise HTTPException(
             status_code=503,
-            detail="GEMINI_API_KEY is not configured. Add it to backend/.env",
+            detail="GROQ_API_KEY is not configured. Add it to backend/.env",
         )
-    genai.configure(api_key=GEMINI_API_KEY)
-    return genai.GenerativeModel(
-        model_name=MODEL,
-        system_instruction=system_prompt,
-    )
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 1024,
+    }
+    resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="PeopleIQ API", version="2.1.0")
+app = FastAPI(title="PeopleIQ API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten to your Vercel URL before production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ── Request / Response models ─────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     question: str
 
@@ -149,9 +148,6 @@ class ChatResponse(BaseModel):
 
 # ── Core functions ────────────────────────────────────────────────────────────
 def generate_sql(question: str, error_context: str = "") -> str:
-    """Step 1 — Send question (+ optional prior error) to Gemini. Returns raw SQL."""
-    model = _get_model(SQL_SYSTEM_PROMPT)
-
     user_content = question
     if error_context:
         user_content = (
@@ -159,33 +155,24 @@ def generate_sql(question: str, error_context: str = "") -> str:
             f"The previous SQL query failed with this error:\n{error_context}\n\n"
             "Please generate a corrected SQL query that avoids this error."
         )
-
-    response = model.generate_content(user_content)
-    raw = response.text.strip()
-
-    # Strip markdown code fences if the model includes them despite instructions
+    raw = call_groq(SQL_SYSTEM_PROMPT, user_content)
     raw = re.sub(r"^```(?:sql)?\s*\n?", "", raw, flags=re.IGNORECASE)
     raw = re.sub(r"\s*```$", "", raw)
     return raw.strip()
 
 
 def validate_sql(sql: str) -> tuple[bool, str]:
-    """Step 2 — Confirm the query is a read-only SELECT."""
     cleaned = sql.strip().upper()
     if not cleaned.startswith("SELECT"):
         return False, "Query does not begin with SELECT"
-    dangerous_keywords = [
-        "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER",
-        "TRUNCATE", "REPLACE", "ATTACH", "DETACH", "PRAGMA", "--", ";--",
-    ]
-    for kw in dangerous_keywords:
+    for kw in ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER",
+               "TRUNCATE", "REPLACE", "ATTACH", "DETACH", "PRAGMA"]:
         if re.search(rf"\b{re.escape(kw)}\b", cleaned):
             return False, f"Query contains forbidden keyword: {kw}"
     return True, "ok"
 
 
 def execute_query(sql: str) -> tuple[list[dict], int]:
-    """Step 3 — Run SQL against peopleiq_dev.db. Strips PII columns."""
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     try:
@@ -193,7 +180,6 @@ def execute_query(sql: str) -> tuple[list[dict], int]:
         raw_rows = cur.fetchall()
     finally:
         con.close()
-
     rows = []
     for raw in raw_rows:
         row_dict = dict(raw)
@@ -205,13 +191,11 @@ def execute_query(sql: str) -> tuple[list[dict], int]:
 
 
 def generate_answer(question: str, rows: list[dict], row_count: int) -> str:
-    """Step 4 — Send result set + original question to Gemini. Returns plain-English answer."""
-    model = _get_model(ANSWER_SYSTEM_PROMPT)
     results_text = str(rows[:50]) if rows else "The query returned no results."
-    response = model.generate_content(
+    return call_groq(
+        ANSWER_SYSTEM_PROMPT,
         f"Question asked: {question}\n\nQuery returned {row_count} row(s):\n{results_text}"
     )
-    return response.text.strip()
 
 
 # ── /chat endpoint ────────────────────────────────────────────────────────────
@@ -233,15 +217,15 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
     error_context = ""
-    last_sql = None
-
     for attempt in range(1, MAX_RETRIES + 1):
         log.info(f"[attempt {attempt}/{MAX_RETRIES}] Generating SQL for: {question!r}")
+        try:
+            sql = generate_sql(question, error_context)
+        except Exception as exc:
+            log.error(f"Groq call failed: {exc}")
+            raise HTTPException(status_code=502, detail=f"Groq API error: {exc}")
 
-        sql = generate_sql(question, error_context)
-        last_sql = sql
         log.info(f"Generated SQL: {sql}")
-
         is_valid, reason = validate_sql(sql)
         if not is_valid:
             error_context = f"SQL validation failed: {reason}. Query was: {sql}"
@@ -259,7 +243,7 @@ async def chat(request: ChatRequest):
         log.info(f"Answer: {answer[:120]}...")
         return ChatResponse(answer=answer, sql=sql, row_count=row_count)
 
-    log.error(f"All {MAX_RETRIES} attempts failed for question: {question!r}")
+    log.error(f"All {MAX_RETRIES} attempts failed for: {question!r}")
     return FALLBACK_RESPONSE
 
 
@@ -270,7 +254,6 @@ async def health():
     table_count = len(re.findall(r"CREATE TABLE", SCHEMA_DDL, re.IGNORECASE))
     return {
         "status": "ok",
-        "db_path": DB_PATH,
         "db_exists": db_exists,
         "schema_tables_loaded": table_count,
         "model": MODEL,
