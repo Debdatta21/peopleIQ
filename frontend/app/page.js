@@ -74,11 +74,21 @@ export default function Home() {
         <span style={styles.badge}>Phase 2 Demo</span>
       </header>
 
+      {/* ── Synthetic data disclaimer ── */}
+      <div style={styles.disclaimer}>
+        <span style={styles.disclaimerIcon}>⚠</span>
+        <span>
+          <strong>Demo only — synthetic data.</strong> All employees, names, and figures are
+          computer-generated and do not represent any real individuals or organizations.
+          No private or confidential information is stored or accessible.
+        </span>
+      </div>
+
       {/* ── Hero ── */}
       <section style={styles.hero}>
         <h1 style={styles.h1}>Ask anything about your workforce.</h1>
         <p style={styles.subheadline}>
-          Natural language people analytics. Powered by your HR data.
+          Natural language people analytics — powered by 500 synthetic employees across 7 years of generated HR data.
         </p>
       </section>
 
@@ -230,6 +240,28 @@ const styles = {
     alignItems: 'center',
     padding: '0 24px 48px',
     background: '#ffffff',
+  },
+
+  /* Disclaimer */
+  disclaimer: {
+    width: '100%',
+    maxWidth: 760,
+    display: 'flex',
+    alignItems: 'flex-start',
+    gap: 10,
+    padding: '10px 16px',
+    background: '#fffbeb',
+    border: '1px solid #fcd34d',
+    borderRadius: 8,
+    fontSize: 13,
+    color: '#92400e',
+    lineHeight: 1.5,
+    marginBottom: 28,
+  },
+  disclaimerIcon: {
+    flexShrink: 0,
+    marginTop: 1,
+    fontSize: 14,
   },
 
   /* Header */
