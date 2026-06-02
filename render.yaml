@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: peopleiq-backend
+    runtime: python
+    rootDir: .
+    buildCommand: pip install -r backend/requirements.txt && pip install faker pandas numpy && python generate_data.py
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false   # set manually in Render dashboard — never committed
+    plan: free
