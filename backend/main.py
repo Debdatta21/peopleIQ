@@ -104,12 +104,25 @@ AND <period_filter on d>
 
 4. Time to fill: SELECT ROUND(AVG(days_to_fill), 1) AS "Avg Days to Fill" FROM fact_requisition WHERE status = 'Filled'
 
-5. Attrition by location or department — join to dim_work_location or dim_org_unit and GROUP BY
+5. Turnover/attrition by location or department — ALWAYS scope terminations to a specific year (default year=2025) and compare against active headcount in that same year:
+SELECT l.location_name AS "Location",
+  ROUND(COUNT(DISTINCT e.person_id) * 100.0 /
+    (SELECT COUNT(DISTINCT person_id) FROM fact_headcount_snapshot h
+     JOIN dim_date d2 ON h.date_id = d2.date_id
+     WHERE h.is_active = 1 AND d2.year = 2025 AND h.location_id = l.location_id), 1
+  ) AS "Turnover Rate %"
+FROM fact_employment_event e
+JOIN dim_work_location l ON e.location_id = l.location_id
+JOIN dim_date d ON e.date_id = d.date_id
+WHERE e.event_type = 'Termination' AND d.year = 2025
+GROUP BY l.location_name, l.location_id
+ORDER BY "Turnover Rate %" DESC
 
 6. Tenure distribution: GROUP BY tenure_band FROM fact_headcount_snapshot WHERE is_active = 1
 
 - Always join dim_position, dim_org_unit, dim_work_location for readable names in GROUP BY queries
 - Never use AVG(is_active) — it produces nonsense. Always count DISTINCT persons.
+- Always scope termination queries to a specific time period (default year=2025). Never count all terminations across all years.
 """
 
 ANSWER_SYSTEM_PROMPT = (
