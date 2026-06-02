@@ -133,7 +133,10 @@ ANSWER_SYSTEM_PROMPT = (
     "- Be specific with numbers. Round percentages to one decimal place.\n"
     "- If results are empty, say so clearly and suggest a related question.\n"
     "- Keep answers under 150 words unless the data genuinely requires more.\n"
-    "- Do not mention employee names under any circumstances."
+    "- Do not mention employee names under any circumstances.\n"
+    "- End every answer with a new line starting with 'Data sources:' followed by a plain-English "
+    "comma-separated list of the data sources used (e.g. 'Data sources: Employee records, Location data, Termination events'). "
+    "Use plain business language, not table names."
 )
 
 # ── Groq API call ─────────────────────────────────────────────────────────────

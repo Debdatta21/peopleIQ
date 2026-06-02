@@ -166,7 +166,19 @@ export default function Home() {
               <p style={styles.questionEcho}>"{question}"</p>
 
               {/* Answer */}
-              <p style={styles.answerText}>{answer}</p>
+              {(() => {
+                const parts = answer.split(/\nData sources:/i);
+                return (
+                  <>
+                    <p style={styles.answerText}>{parts[0].trim()}</p>
+                    {parts[1] && (
+                      <p style={styles.sources}>
+                        <span style={styles.sourcesLabel}>Data sources:</span>{parts[1].trim()}
+                      </p>
+                    )}
+                  </>
+                );
+              })()}
 
               {/* Row count pill */}
               {rowCount !== null && (
@@ -488,6 +500,23 @@ const styles = {
     borderRadius: 20,
     padding: '3px 10px',
     fontWeight: 500,
+  },
+
+  /* Data sources */
+  sources: {
+    marginTop: 14,
+    fontSize: 12,
+    color: '#6b7280',
+    background: '#f9fafb',
+    border: '1px solid #e5e7eb',
+    borderRadius: 6,
+    padding: '7px 12px',
+    lineHeight: 1.5,
+  },
+  sourcesLabel: {
+    fontWeight: 600,
+    color: TEAL,
+    marginRight: 4,
   },
 
   /* SQL collapsible */
