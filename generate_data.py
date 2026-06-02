@@ -749,8 +749,8 @@ def build_fact_recruiting_pipeline(req_df: pd.DataFrame,
 
     for _, req in req_df.iterrows():
         req_id   = int(req["req_id"])
-        pub_date = date.fromisoformat(req["published_date"])
-        fill_date = date.fromisoformat(req["fill_date"]) if req["fill_date"] else None
+        pub_date = date.fromisoformat(str(req["published_date"])[:10])
+        fill_date = date.fromisoformat(str(req["fill_date"])[:10]) if req["fill_date"] and str(req["fill_date"]) not in ("None", "NaT", "") else None
         status   = req["status"]
 
         # Number of candidates in funnel: 4-15
