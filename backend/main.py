@@ -79,13 +79,37 @@ Hard rules — follow every one, no exceptions:
    - "this quarter" / "Q4"        → quarter = 4 AND year = 2025
    - "last quarter" / "Q3"        → quarter = 3 AND year = 2025
 
-Key query patterns:
-- Current headcount: COUNT(*) FROM fact_headcount_snapshot WHERE date_id = (SELECT MAX(date_id) FROM fact_headcount_snapshot WHERE is_active = 1)
-- Attrition rate for a year: (terminated / avg_active_headcount) * 100, both for that year
-- Terminations: fact_employment_event WHERE event_type = 'Termination'
-- Time to fill: AVG(days_to_fill) FROM fact_requisition WHERE status = 'Filled'
-- Pipeline funnel: GROUP BY stage_name, COUNT and conversion rate from fact_recruiting_pipeline
+Key query patterns — use these exactly:
+
+1. Current headcount:
+SELECT COUNT(*) AS "Current Headcount"
+FROM fact_headcount_snapshot
+WHERE is_active = 1
+AND date_id = (SELECT MAX(date_id) FROM fact_headcount_snapshot WHERE is_active = 1)
+
+2. Attrition rate for a period (e.g. quarter or year) — ALWAYS use this pattern:
+SELECT ROUND(
+  COUNT(DISTINCT e.person_id) * 100.0 /
+  (SELECT COUNT(DISTINCT person_id) FROM fact_headcount_snapshot
+   WHERE is_active = 1
+   AND date_id IN (SELECT date_id FROM dim_date WHERE <period_filter>)),
+  1
+) AS "Attrition Rate %"
+FROM fact_employment_event e
+JOIN dim_date d ON e.date_id = d.date_id
+WHERE e.event_type = 'Termination'
+AND <period_filter on d>
+
+3. Terminations count: SELECT COUNT(*) FROM fact_employment_event WHERE event_type = 'Termination'
+
+4. Time to fill: SELECT ROUND(AVG(days_to_fill), 1) AS "Avg Days to Fill" FROM fact_requisition WHERE status = 'Filled'
+
+5. Attrition by location or department — join to dim_work_location or dim_org_unit and GROUP BY
+
+6. Tenure distribution: GROUP BY tenure_band FROM fact_headcount_snapshot WHERE is_active = 1
+
 - Always join dim_position, dim_org_unit, dim_work_location for readable names in GROUP BY queries
+- Never use AVG(is_active) — it produces nonsense. Always count DISTINCT persons.
 """
 
 ANSWER_SYSTEM_PROMPT = (
