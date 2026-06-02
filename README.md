@@ -1,154 +1,147 @@
-# PeopleIQ — Workforce Intelligence Platform
+# ◈ PeopleIQ — Workforce Intelligence Platform
 
-> Ask anything about your workforce. Get answers in seconds.
+> **Ask anything about your workforce. Get answers in seconds.**
 
-<!-- Screenshot placeholder — add after Phase 2 UI is built -->
+Natural language people analytics for HR leaders, CHROs, and executives — no SQL, no dashboards, no data analyst required.
+
+**🔴 Live Demo:** [people-iq.vercel.app](https://people-iq.vercel.app) *(synthetic data only — no real employee data)*
 
 ---
 
 ## What is PeopleIQ?
 
-PeopleIQ is a natural language analytics platform that lets HR leaders ask plain-English questions about their workforce data and get instant, accurate answers — no SQL, no dashboards, no data analysts required. It is built for HR Directors, CHROs, and People Analytics teams at mid-size companies who need workforce intelligence without the infrastructure overhead.
-
----
-
-## Why I built this
-
-Every company I've worked with has the same problem: the data exists, but getting a real answer from it takes days. An HR leader wants to know which departments have the highest 90-day attrition — a question that should take ten seconds — and instead waits a week for someone to build a report. I built PeopleIQ to collapse that gap entirely. The intelligence is in the data model and the query engine. The chat interface makes it accessible to anyone who can type a sentence. This is what people analytics should feel like.
-
----
-
-## How it works
+PeopleIQ is a chat interface for HR data. You type a question. It answers.
 
 ```
-User asks a question
-        ↓
-Text-to-SQL engine (Claude API) converts it to SQL
-        ↓
-SQL executes against the star schema database
-        ↓
-Claude converts the result set into a plain-English answer
+"What is our attrition rate this quarter?"     →  4.2%, down from 6.1% last quarter.
+"Which locations have the highest turnover?"   →  Sacramento 18%, San Antonio 16%, Pittsburgh 12%.
+"How long does it take us to fill a role?"     →  43 days on average. Engineering roles take 58 days.
+"Which departments grew the most this year?"   →  HR +46, Talent Acquisition +39, Marketing +38.
+"How many people left in their first 90 days?" →  47 employees — 9.4% of total headcount.
 ```
 
-The backend is a FastAPI application that receives a natural language question, assembles a prompt containing the full database schema, sends it to the Anthropic Claude API to generate a SQL query, executes that query against a SQLite database built on a purpose-designed star schema, and then passes the result set back to Claude to produce a human-readable answer. The frontend is a single-page Next.js application deployed on Vercel. The data layer is a 12-table dimensional model — six dimension tables and six fact tables — populated with 500 synthetic employees across 7 years of workforce history.
+Behind every answer: a dimensional data model, a Text-to-SQL engine powered by an LLM, and a clean frontend. Every answer shows plain-English **Data sources** so stakeholders know exactly what data was used.
 
 ---
 
-## Live Demo
+## Architecture
 
-> Link to Vercel deployment — coming after Phase 2 deployment
+```
+┌─────────────────────────────────────────────────────────┐
+│  LAYER 1 — Data Sources                                  │
+│  Databricks SQL  │  Microsoft Fabric  │  CSV flat-file   │
+│  (HR views)      │  (OneLake/dbt)     │  (any HRIS)      │
+└──────────────────────────┬──────────────────────────────┘
+                           │ normalize to canonical schema
+┌──────────────────────────▼──────────────────────────────┐
+│  LAYER 2 — Connector & Canonical HR Schema               │
+│  12-table star schema (6 dims + 6 facts)                 │
+│  Python connector — Databricks ODBC / CSV ingestion      │
+└──────────────────────────┬──────────────────────────────┘
+                           │ SQL query execution
+┌──────────────────────────▼──────────────────────────────┐
+│  LAYER 3 — Intelligence Core (FastAPI + Groq LLM)        │
+│  Text-to-SQL  →  SQL Validator  →  Query Engine          │
+│  →  Answer Generator (plain English + data sources)      │
+└──────────────────────────┬──────────────────────────────┘
+                           │ REST API
+┌──────────────────────────▼──────────────────────────────┐
+│  LAYER 4 — User Interface (Next.js · Vercel)             │
+│  HR Director │ CHRO │ HR Business Partner │ Exec         │
+└─────────────────────────────────────────────────────────┘
+```
 
-**Example questions you can ask:**
+### Technology Partners Integration Path
 
-- What is our current total headcount?
-- What is our attrition rate this quarter?
-- Which locations have the highest turnover?
-- How long does it take us to fill a role on average?
-- Which departments grew the most this year?
-- How many people left within their first 90 days?
-- What percentage of terminations were voluntary last year?
-- Which positions take the longest to fill?
-- How does turnover compare across regions?
-- What is the tenure distribution of our active workforce?
+PeopleIQ is designed to sit **on top of existing Databricks/Fabric infrastructure**, not replace it:
+
+| Term | Approach |
+|------|----------|
+| **Short term** | CSV exports from any HRIS → PeopleIQ. Demo-ready immediately. |
+| **Medium term** | Expose 2–3 HR views in Databricks SQL → PeopleIQ queries them directly. Data stays in your warehouse. |
+| **Long term** | Power BI for structured reporting. PeopleIQ for ad-hoc natural language questions. Same data, two interfaces. |
+
+> *Power BI answers the questions we already know to ask. PeopleIQ answers the questions people type into a search box.*
 
 ---
 
 ## Tech Stack
 
 | Layer | Technology |
-|---|---|
-| Frontend | Next.js 14, deployed on Vercel |
-| Backend | FastAPI (Python 3.11+) |
-| Query Engine | Anthropic Claude API — Text-to-SQL |
-| Data Layer | Star schema — 6 dimensions, 6 fact tables |
-| Database | SQLite (dev) / PostgreSQL (prod) |
-| Data | Synthetic — 500 employees, 7 years, 12 tables |
+|-------|-----------|
+| Frontend | Next.js 14 — deployed on Vercel |
+| Backend | FastAPI (Python 3.14) — deployed on Render |
+| LLM | Groq API — `llama-3.3-70b-versatile` (free tier) |
+| Database (dev) | SQLite — 12-table star schema, synthetic data |
+| Database (prod) | Databricks SQL / Microsoft Fabric |
 | Data Generation | Python — Faker, pandas, numpy |
+| Security | PII stripped before LLM, read-only SQL validation |
 
 ---
 
 ## Data Model
 
-PeopleIQ uses a canonical dimensional star schema designed to be system-agnostic — it does not assume UKG, Workday, ADP, or any specific HRIS. All source system fields map to this schema; the intelligence core always queries against it.
+System-agnostic dimensional star schema. All source systems map to this schema.
 
-**Dimension tables** (reference data — who, where, what):
+**Dimension tables:** `dim_person`, `dim_position`, `dim_org_unit`, `dim_work_location`, `dim_company`, `dim_date`
 
-| Table | Grain | Key Fields |
-|---|---|---|
-| `dim_person` | One row per employee | person_id, status, hire_date, termination_date, employment_type |
-| `dim_position` | One row per standard role | position_id, position_title, job_family, job_level |
-| `dim_org_unit` | One row per department | org_unit_id, org_unit_name, parent_org_unit_id, org_level |
-| `dim_work_location` | One row per site | location_id, location_name, city, state, region, location_type |
-| `dim_company` | One row per legal entity | company_id, company_name, company_code |
-| `dim_date` | One row per calendar day | date_id, year, quarter, month, is_month_end, fiscal_year |
-
-**Fact tables** (measurements and events):
-
-| Table | Grain | Key Measures |
-|---|---|---|
-| `fact_headcount_snapshot` | Person × Month-end | is_active, tenure_months, tenure_band |
-| `fact_employment_event` | Person × Event | event_type (Hire/Termination/Transfer), tenure_days_at_event |
-| `fact_position_assignment` | Person × Role × Date range | effective_start, effective_end, is_current |
-| `fact_requisition` | One row per open role | status, days_to_fill, hires_count |
-| `fact_recruiting_pipeline` | Candidate × Stage | stage_name, stage_date, conversion_flag |
-| `fact_exit_interview` | One row per respondent | reason_name, manager_rating_avg, voluntary_flag |
-
-See `PeopleIQ_PRD_v02.docx` for the full data model specification.
+**Fact tables:** `fact_headcount_snapshot`, `fact_employment_event`, `fact_position_assignment`, `fact_requisition`, `fact_recruiting_pipeline`, `fact_exit_interview`
 
 ---
 
 ## Running Locally
 
-Assumes Python 3.11+ and Node 18+ are installed.
-
-### 1. Clone and generate data
+Requires Python 3.11+ and Node 18+.
 
 ```bash
+# 1. Clone and generate synthetic data
 git clone https://github.com/Debdatta21/peopleIQ.git
 cd peopleIQ
-pip install -r requirements.txt
+pip install faker pandas numpy
 python generate_data.py
-# Creates outputs/ with 12 CSVs and peopleiq_dev.db
-```
 
-### 2. Start the backend
-
-```bash
+# 2. Start the backend
 cd backend
 pip install -r requirements.txt
-cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
+cp .env.example .env          # Add your GROQ_API_KEY
 uvicorn main:app --reload --port 8000
-# API running at http://localhost:8000
-```
 
-### 3. Start the frontend
-
-```bash
-cd frontend
+# 3. Start the frontend (new terminal)
+cd ../frontend
 npm install
-cp .env.local.example .env.local
+cp .env.local.example .env.local   # Set NEXT_PUBLIC_API_URL=http://localhost:8000
 npm run dev
-# UI running at http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) and start asking questions.
+Open http://localhost:3000. Get a free Groq API key at https://console.groq.com.
 
 ---
 
 ## Project Status
 
 | Phase | Description | Status |
-|---|---|---|
-| Phase 1 | Data Foundation — canonical schema, synthetic data generator, 12-table star schema | ✅ Complete |
-| Phase 2 | Chat Interface — FastAPI backend, Text-to-SQL engine, Next.js frontend, Vercel deployment | 🔄 In Progress |
-| Phase 3 | Live HRIS Connector — UKG People Fabric API, CSV flat-file connector, OAuth 2.0 | ⬜ Planned |
-| Phase 4 | Multi-tenant Product — multi-company, role-based access, first paying customer | ⬜ Planned |
+|-------|-------------|--------|
+| **Phase 1** | Data Foundation — canonical schema, synthetic data generator, 12-table SQLite | ✅ Complete |
+| **Phase 2** | Chat Interface — FastAPI, Text-to-SQL, Next.js, Render + Vercel deployment | ✅ Complete |
+| **Phase 3** | Live Data Connector — Databricks SQL (primary), CSV fallback, HRIS OAuth | ⬜ Planned |
+| **Phase 4** | Multi-tenant Product — role-based access, Workday connector, first customer | ⬜ Planned |
 
 ---
 
-## About
+## Security & Privacy
 
-Built by **Debdatta Gupta** — Data Analyst & Analytics Engineer at Technology Partners, St. Louis MO.
+- All demo data is **100% synthetic** — no real employees, no real organizations
+- PII columns (`full_name`, `email`) stripped from all result sets before reaching the LLM
+- SQL validator enforces read-only queries — no mutations possible
+- API keys stored in environment variables only, never committed to the repo
+- Every answer shows a plain-English **Data sources** label for stakeholder transparency
 
-[LinkedIn](https://www.linkedin.com/in/debdattagupta) · [GitHub](https://github.com/Debdatta21)
+---
+
+## Documentation
+
+See `PeopleIQ_PRD_v03.docx` for the full Product Requirements & Architecture Document including the Databricks/Fabric integration plan.
+
+---
+
+Built by **Debdatta Gupta** — Analytics Engineer at Technology Partners, St. Louis MO
