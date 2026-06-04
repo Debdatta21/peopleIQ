@@ -319,10 +319,14 @@ def _detect_chart(rows: list[dict], row_count: int) -> Optional[dict]:
     if label_col is None:
         label_col = keys[0]          # fall back to first column
 
-    # Find first numeric column that is NOT the label column → Y-axis values
+    # Find first meaningful numeric column (skip ID/key columns) → Y-axis values
+    def _is_id_col(k: str) -> bool:
+        kl = k.lower().strip()
+        return kl == "id" or kl.endswith(" id") or kl.endswith("_id") or kl == "person id"
+
     value_col = None
     for k in keys:
-        if k == label_col:
+        if k == label_col or _is_id_col(k):
             continue
         try:
             float(rows[0][k])
