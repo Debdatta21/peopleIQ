@@ -1281,6 +1281,44 @@ def validate(tables: dict):
     else:
         print("  ✓ Zero orphan FK violations confirmed")
 
+    # ── Compensation summary ───────────────────────────────────────────────
+    if "fact_compensation" in tables:
+        comp = tables["fact_compensation"]
+        print(f"\n  COMPENSATION SUMMARY")
+        print(f"  {'Comp Type':<20} {'People':>8} {'Avg Amount':>12} {'Min':>10} {'Max':>10}")
+        print("  " + "-" * 63)
+        current = comp[comp["is_current"] == 1]
+        for ctype, grp in current.groupby("compensation_type"):
+            print(f"  {ctype:<20} {grp['person_id'].nunique():>8} "
+                  f"{grp['base_amount'].mean():>12,.0f} "
+                  f"{grp['base_amount'].min():>10,.0f} "
+                  f"{grp['base_amount'].max():>10,.0f}")
+        n_promotions = (comp["change_reason"] == "Promotion").sum()
+        avg_merit = comp[comp["change_reason"].isin(
+            ["Annual Review","Merit Increase","Market Adjustment"])]["change_pct"].mean()
+        print(f"\n  Promotion events:       {n_promotions}")
+        print(f"  Avg merit increase:     {avg_merit:.1f}%")
+
+    # ── Employment type breakdown ──────────────────────────────────────────
+    if "dim_person" in tables:
+        persons = tables["dim_person"]
+        print(f"\n  WORKER CLASSIFICATION")
+        print(f"  {'Type':<25} {'Count':>6} {'%':>6}")
+        print("  " + "-" * 40)
+        total = len(persons)
+        for etype, grp in persons.groupby("employment_type"):
+            pct = len(grp) / total * 100
+            print(f"  {etype:<25} {len(grp):>6} {pct:>5.1f}%")
+
+    # ── Promotion flag check ───────────────────────────────────────────────
+    if "fact_position_assignment" in tables:
+        pa = tables["fact_position_assignment"]
+        n_promo_flag = (pa["promotion_flag"] == 1).sum()
+        n_total_pa   = len(pa)
+        print(f"\n  PROMOTION FLAG")
+        print(f"  Flagged promotions: {n_promo_flag} of {n_total_pa} assignments "
+              f"({100*n_promo_flag/n_total_pa:.1f}%)")
+
     print("\n" + "═" * 60)
 
 
