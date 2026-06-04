@@ -44,21 +44,22 @@ DB_PATH = os.getenv(
 PII_COLUMNS = {"full_name", "email", "first_name", "last_name"}
 
 # ── Schema extraction ─────────────────────────────────────────────────────────
-def _extract_schema_ddl() -> str:
-    if not os.path.exists(DB_PATH):
-        log.warning(f"Database not found at {DB_PATH}. Run generate_data.py first.")
-        return ""
-    con = sqlite3.connect(DB_PATH)
-    cur = con.execute(
-        "SELECT name, sql FROM sqlite_master "
-        "WHERE type='table' AND sql IS NOT NULL ORDER BY name"
-    )
-    rows = cur.fetchall()
-    con.close()
-    return "\n\n".join(sql for _, sql in rows)
-
-
-SCHEMA_DDL = _extract_schema_ddl()
+# Compact schema — table(columns) only. Saves ~1000 tokens vs full DDL.
+SCHEMA_DDL = """
+dim_company(company_id, company_name, company_code)
+dim_date(date_id, full_date, year, quarter, month, month_name, day_of_week, is_weekend, fiscal_year)
+dim_org_unit(org_unit_id, org_unit_name, parent_org_unit_id, org_level, company_id)
+dim_person(person_id, status, hire_date, termination_date, termination_type, employment_type, company_id)
+dim_position(position_id, position_title, job_family, job_level, company_id)
+dim_work_location(location_id, location_name, city, state, region, location_type, company_id)
+fact_compensation(compensation_id, person_id, position_id, company_id, date_id, effective_date, base_amount, compensation_type, change_reason, change_pct, is_current)
+fact_employment_event(event_id, person_id, date_id, event_type, termination_type, tenure_days_at_event, position_id, org_unit_id, location_id, company_id)
+fact_exit_interview(exit_id, person_id, position_id, org_unit_id, location_id, company_id, date_id, exit_date, tenure_days, reason_name, manager_rating_avg, voluntary_flag)
+fact_headcount_snapshot(snapshot_id, person_id, date_id, position_id, org_unit_id, location_id, company_id, is_active, employment_type, tenure_days, tenure_months, tenure_band)
+fact_position_assignment(assignment_id, person_id, position_id, org_unit_id, location_id, company_id, effective_start, effective_end, is_current, promotion_flag)
+fact_recruiting_pipeline(pipeline_id, req_id, candidate_id, stage_name, stage_date, date_id, conversion_flag, company_id)
+fact_requisition(req_id, position_id, org_unit_id, location_id, company_id, status, published_date, fill_date, days_to_fill, hires_count)
+"""
 
 SQL_SYSTEM_PROMPT = f"""You are the Text-to-SQL engine for PeopleIQ, a workforce intelligence platform.
 Output ONE valid SQLite SELECT query. No markdown, no explanation.
@@ -329,7 +330,7 @@ async def chat(request: ChatRequest):
 @app.get("/health")
 async def health():
     db_exists = os.path.exists(DB_PATH)
-    table_count = len(re.findall(r"CREATE TABLE", SCHEMA_DDL, re.IGNORECASE))
+    table_count = len([l for l in SCHEMA_DDL.strip().splitlines() if l.strip()])
     return {
         "status": "ok",
         "db_exists": db_exists,
