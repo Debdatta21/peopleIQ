@@ -110,25 +110,42 @@ JOIN dim_date d ON e.date_id=d.date_id
 WHERE e.event_type='Termination' AND d.year=2026
 GROUP BY l.location_name, l.location_id ORDER BY "Turnover Rate %" DESC
 
-5. Compensation by job level — P25/Median/P75:
-SELECT job_level AS "Level", compensation_type AS "Comp Type",
-  COUNT(DISTINCT person_id) AS "Employees",
-  ROUND(AVG(base_amount),0) AS "Avg",
-  ROUND(AVG(CASE WHEN pr BETWEEN 0.20 AND 0.30 THEN base_amount END),0) AS "P25",
-  ROUND(AVG(CASE WHEN pr BETWEEN 0.45 AND 0.55 THEN base_amount END),0) AS "P50 Median",
-  ROUND(AVG(CASE WHEN pr BETWEEN 0.70 AND 0.80 THEN base_amount END),0) AS "P75"
-FROM (SELECT fc.*, p.job_level,
-        PERCENT_RANK() OVER (PARTITION BY p.job_level,fc.compensation_type ORDER BY fc.base_amount) AS pr
-      FROM fact_compensation fc JOIN dim_position p ON fc.position_id=p.position_id WHERE fc.is_current=1)
-GROUP BY job_level, compensation_type ORDER BY AVG(base_amount) DESC
+5. Compensation BY job level — always GROUP BY job_level (use for "salary by level", "pay by level", "average salary per level", "pay range by level"):
+SELECT p.job_level AS "Job Level",
+  COUNT(DISTINCT fc.person_id) AS "Employees",
+  ROUND(AVG(fc.base_amount),0) AS "Avg Salary",
+  MIN(fc.base_amount) AS "Min Salary",
+  MAX(fc.base_amount) AS "Max Salary",
+  ROUND(AVG(CASE WHEN pr BETWEEN 0.45 AND 0.55 THEN fc.base_amount END),0) AS "Median Salary"
+FROM (SELECT fc.*, p2.job_level,
+        PERCENT_RANK() OVER (PARTITION BY p2.job_level ORDER BY fc.base_amount) AS pr
+      FROM fact_compensation fc JOIN dim_position p2 ON fc.position_id=p2.position_id
+      WHERE fc.is_current=1 AND fc.compensation_type='Salary') fc
+JOIN dim_position p ON fc.position_id=p.position_id
+GROUP BY p.job_level ORDER BY AVG(fc.base_amount) DESC
 
-6. Employees with NO salary increase since a date — use this exact pattern:
+5b. Pay RANGE / spread between highest and lowest job levels:
+SELECT
+  MAX(avg_sal) - MIN(avg_sal) AS "Pay Spread ($)",
+  MAX(job_level) AS "Highest Level",  -- alphabetically last; use MAX(avg_sal) logic below
+  MIN(job_level) AS "Lowest Level"
+FROM (
+  SELECT p.job_level, ROUND(AVG(fc.base_amount),0) AS avg_sal
+  FROM fact_compensation fc JOIN dim_position p ON fc.position_id=p.position_id
+  WHERE fc.is_current=1 AND fc.compensation_type='Salary'
+  GROUP BY p.job_level
+)
+-- BETTER: show full table from Pattern 5 and let the answer layer describe the spread.
+
+6. Employees with NO salary increase in the past N years — compute cutoff as today minus N years:
+-- "past 2 years" → cutoff = DATE('2026-06-04','-2 years') = '2024-06-04'
+-- "past 1 year"  → cutoff = DATE('2026-06-04','-1 year')  = '2025-06-04'
 SELECT COUNT(DISTINCT p.person_id) AS "Employees With No Raise"
 FROM dim_person p
 WHERE p.status='Active'
 AND p.person_id NOT IN (
   SELECT DISTINCT fc.person_id FROM fact_compensation fc
-  WHERE fc.effective_date >= '<date>'
+  WHERE fc.effective_date >= DATE('2026-06-04','-2 years')
   AND fc.change_reason IN ('Annual Review','Merit Increase','Market Adjustment','Promotion')
 )
 
@@ -137,7 +154,7 @@ SELECT change_reason AS "Reason", ROUND(AVG(change_pct),1) AS "Avg % Increase", 
 FROM fact_compensation WHERE change_reason != 'Hire'
 GROUP BY change_reason ORDER BY "Avg % Increase" DESC
 
-8. Promotions with pay increase (cross-table):
+8. Promotions with pay increase (cross-table) — join on YEAR only (not month), compensation review date and assignment start date are in the same year but not same month:
 SELECT pa.person_id AS "Person ID",
   pos_old.job_level AS "Previous Level", pos_new.job_level AS "New Level",
   ROUND(fc.change_pct,1) AS "Pay Increase %",
@@ -145,7 +162,7 @@ SELECT pa.person_id AS "Person ID",
 FROM fact_position_assignment pa
 JOIN dim_position pos_new ON pa.position_id=pos_new.position_id
 JOIN fact_compensation fc ON pa.person_id=fc.person_id AND fc.change_reason='Promotion'
-  AND SUBSTR(fc.effective_date,1,7)=SUBSTR(pa.effective_start,1,7)
+  AND SUBSTR(fc.effective_date,1,4)=SUBSTR(pa.effective_start,1,4)
 JOIN dim_position pos_old ON pos_old.position_id=(
   SELECT position_id FROM fact_position_assignment
   WHERE person_id=pa.person_id AND effective_start < pa.effective_start
@@ -155,12 +172,22 @@ ORDER BY pa.effective_start DESC
 
 9. Promotion rate: SELECT ROUND(COUNT(DISTINCT person_id)*100.0/(SELECT COUNT(*) FROM dim_person WHERE status='Active'),1) AS "Promotion Rate %" FROM fact_position_assignment WHERE promotion_flag=1
 
+10. Contractor vs full-time pay comparison — always show compensation_type separately with units note; NEVER compare Contract Rate (hourly $/hr) directly to Salary (annual $) as a ratio:
+SELECT compensation_type AS "Comp Type",
+  COUNT(DISTINCT person_id) AS "Employees",
+  ROUND(AVG(base_amount),0) AS "Avg Pay",
+  MIN(base_amount) AS "Min", MAX(base_amount) AS "Max"
+FROM fact_compensation WHERE is_current=1
+GROUP BY compensation_type ORDER BY AVG(base_amount) DESC
+
 Rules for compensation:
 - is_current=1 → current state questions ("what is comp today")
 - Filter by effective_date year → historical questions ("what were salaries in 2025")
-- compensation_type: 'Salary' (W2 Salaried), 'Hourly' (W2 Hourly), 'Contract Rate' (Contingent/Agency)
+- compensation_type: 'Salary' (annual $, W2 Salaried), 'Hourly' ($/hr, W2 Hourly), 'Contract Rate' ($/hr, Contingent/Agency)
+- Salary is annual dollars. Hourly and Contract Rate are dollars per hour. Never compare them as if same units.
 - change_reason values: 'Hire','Annual Review','Merit Increase','Market Adjustment','Promotion'
 - Never mix is_current=1 with a year filter
+- "past N years/months" → use DATE('2026-06-04','-N years') for the cutoff, not a hardcoded January date
 """
 
 
@@ -170,6 +197,9 @@ ANSWER_SYSTEM_PROMPT = (
     "- Write in complete sentences. Use plain English.\n"
     "- Never use SQL, column names, or technical jargon.\n"
     "- Be specific with numbers. Round percentages to one decimal place.\n"
+    "- Compensation units: 'Salary' values are annual dollars (e.g. $74,000/yr). "
+    "'Hourly' and 'Contract Rate' values are dollars per hour (e.g. $35/hr). "
+    "NEVER compare annual salary to hourly rates as if they are the same unit — always state the unit.\n"
     "- If results are empty, say so clearly and suggest a related question.\n"
     "- Keep answers under 150 words unless the data genuinely requires more.\n"
     "- Do not mention employee names under any circumstances.\n"
