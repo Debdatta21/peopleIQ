@@ -200,7 +200,14 @@ def call_groq(system_prompt: str, user_content: str) -> str:
     }
     resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    data = resp.json()
+    usage = data.get("usage", {})
+    log.info(
+        f"[tokens] prompt={usage.get('prompt_tokens','?')} "
+        f"completion={usage.get('completion_tokens','?')} "
+        f"total={usage.get('total_tokens','?')}"
+    )
+    return data["choices"][0]["message"]["content"].strip()
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
@@ -269,11 +276,33 @@ def execute_query(sql: str) -> tuple[list[dict], int]:
     return rows, len(rows)
 
 
+def _rows_to_csv(rows: list[dict]) -> str:
+    """Convert rows to compact CSV — ~30% fewer tokens than dict repr."""
+    if not rows:
+        return ""
+    headers = list(rows[0].keys())
+    lines = [",".join(headers)]
+    for r in rows:
+        lines.append(",".join(str(r.get(h, "")) for h in headers))
+    return "\n".join(lines)
+
+
 def generate_answer(question: str, rows: list[dict], row_count: int) -> str:
-    results_text = str(rows[:50]) if rows else "The query returned no results."
+    if not rows:
+        results_text = "The query returned no results."
+    elif row_count == 1:
+        # Aggregate result — pass everything
+        results_text = _rows_to_csv(rows)
+    else:
+        # Multi-row — top 10 is enough for the LLM to generate an insight
+        sample = rows[:10]
+        results_text = _rows_to_csv(sample)
+        if row_count > 10:
+            results_text += f"\n... ({row_count} total rows, showing top 10)"
+    log.info(f"[answer] passing {min(row_count,10)}/{row_count} rows to LLM")
     return call_groq(
         ANSWER_SYSTEM_PROMPT,
-        f"Question asked: {question}\n\nQuery returned {row_count} row(s):\n{results_text}"
+        f"Question: {question}\n\nResults ({row_count} row(s)):\n{results_text}"
     )
 
 
