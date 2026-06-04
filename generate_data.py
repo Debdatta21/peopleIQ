@@ -18,7 +18,7 @@ Realism constraints implemented:
   - 70 % voluntary / 30 % involuntary terminations
   - Right-skewed tenure: exponential recency bias in hire dates
   - Seasonal hiring: Q1 + Q3 weighted higher
-  - dim_date spine: 2019-01-01 → 2025-12-31
+  - dim_date spine: 2019-01-01 → 2026-06-04
   - All events ≤ today (2026-05-31) — but events capped to spine end
   - Zero orphan FK violations
 """
@@ -37,13 +37,14 @@ random.seed(SEED);  np.random.seed(SEED)
 fake = Faker("en_US");  Faker.seed(SEED)
 
 SPINE_START  = date(2019, 1, 1)
-SPINE_END    = date(2025, 12, 31)
-TODAY        = date(2025, 12, 31)   # cap events to spine end (≤ today per PRD)
+SPINE_END    = date(2026, 6, 4)
+TODAY        = date(2026, 6, 4)     # updated to current date
 COMPANY_ID   = 1
 
 OUTPUT_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-DB_PATH = os.path.join(OUTPUT_DIR, "peopleiq_dev.db")
+_FINAL_DB_PATH = os.path.join(OUTPUT_DIR, "peopleiq_dev.db")
+DB_PATH = "/tmp/peopleiq_dev.db"
 
 # ── Date helpers ──────────────────────────────────────────────────────────────
 
@@ -341,7 +342,7 @@ def build_dim_person(pos_df: pd.DataFrame):
     of dicts containing date objects needed for fact-table generation.
     """
     # Year weights for hire dates: exponential recency bias (right-skewed tenure)
-    years = list(range(2019, 2026))   # 2019-2025 (within spine)
+    years = list(range(2019, 2027))   # 2019-2026 (within spine)
     year_w = np.array([math.exp(0.55 * i) for i in range(len(years))], dtype=float)
     year_w /= year_w.sum()
 
@@ -350,9 +351,10 @@ def build_dim_person(pos_df: pd.DataFrame):
     EARLY_CUTOFF  = 90       # days
     VOL_PROB      = 0.70     # post-processed to enforce exactly 70/30
 
-    emp_type_pool = (["Full-Time"] * 70 +
-                     ["Part-Time"] * 15 +
-                     ["Contractor"] * 15)
+    emp_type_pool = (["W2 Salaried"]       * 65 +
+                     ["W2 Hourly"]          * 15 +
+                     ["Contingent (1099)"]  * 12 +
+                     ["Agency/Leased"]      *  8)
 
     person_rows = []
     person_records = []    # internal list with date objects
@@ -428,6 +430,17 @@ def build_dim_person(pos_df: pd.DataFrame):
     return pd.DataFrame(person_rows), person_records
 
 
+
+# Job level hierarchy for promotion detection (higher index = senior)
+_LEVEL_RANK = {
+    "Individual Contributor": 1,
+    "Manager":                2,
+    "Senior Manager":         3,
+    "Director":               4,
+    "VP":                     5,
+    "C-Suite":                6,
+}
+
 # ── 7. fact_position_assignment ───────────────────────────────────────────────
 
 def build_fact_position_assignment(person_records: list, pos_df: pd.DataFrame):
@@ -489,6 +502,11 @@ def build_fact_position_assignment(person_records: list, pos_df: pd.DataFrame):
                 eff_end  = (next_start - timedelta(days=1)).isoformat()
                 is_cur   = 0
 
+            # Promotion flag: level must increase (comp raise checked post-hoc in fact_compensation)
+            prev_level = pos_df.loc[pos_df["position_id"] == segments[k-1][1], "job_level"].values[0] if k > 0 else None
+            cur_level_val = pos_df.loc[pos_df["position_id"] == pos_id, "job_level"].values[0] if not pos_df[pos_df["position_id"] == pos_id].empty else "Individual Contributor"
+            promo_flag = 1 if (k > 0 and prev_level and
+                               _LEVEL_RANK.get(cur_level_val, 0) > _LEVEL_RANK.get(prev_level, 0)) else 0
             rows.append({
                 "assignment_id":  assignment_id,
                 "person_id":      pid,
@@ -499,6 +517,7 @@ def build_fact_position_assignment(person_records: list, pos_df: pd.DataFrame):
                 "effective_start": seg_start.isoformat(),
                 "effective_end":  eff_end,
                 "is_current":     is_cur,
+                "promotion_flag": promo_flag,
             })
             lookup[pid].append({
                 "start":   seg_start,
@@ -684,7 +703,7 @@ def build_fact_requisition(pos_df: pd.DataFrame, date_id_set: set) -> pd.DataFra
         org_id = random.choice(all_org_ids)
 
         # Published date: 2019 to 2025, seasonal
-        yr          = int(np.random.choice(range(2019, 2026),
+        yr          = int(np.random.choice(range(2019, 2027),
                           p=year_weights_for_reqs()))
         pub_date    = seasonal_date(yr)
         if pub_date > SPINE_END:
@@ -725,8 +744,8 @@ def build_fact_requisition(pos_df: pd.DataFrame, date_id_set: set) -> pd.DataFra
     return pd.DataFrame(rows)
 
 def year_weights_for_reqs():
-    years = list(range(2019, 2026))
-    w = np.array([1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6])
+    years = list(range(2019, 2027))
+    w = np.array([1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7])
     return (w / w.sum()).tolist()
 
 
@@ -863,6 +882,152 @@ def build_fact_exit_interview(person_records: list, lookup: dict,
     return pd.DataFrame(rows)
 
 
+
+# ── 13. fact_compensation ─────────────────────────────────────────────────────
+
+_SALARY_BANDS = {
+    "C-Suite":                (220000, 420000),
+    "VP":                     (155000, 230000),
+    "Director":               (115000, 165000),
+    "Senior Manager":         (95000,  135000),
+    "Manager":                (72000,  108000),
+    "Individual Contributor": (44000,   92000),
+}
+
+_COMP_TYPE = {
+    "W2 Salaried":      "Salary",
+    "W2 Hourly":        "Hourly",
+    "Contingent (1099)": "Contract Rate",
+    "Agency/Leased":    "Contract Rate",
+}
+
+_REVIEW_MONTH_POOL = [1, 1, 1, 2, 2, 3, 4, 7, 10]
+
+
+def _apply_comp_bump(prev: float, pct: float, is_hourly: bool) -> float:
+    raw = prev * (1 + pct)
+    return round(raw, 2) if is_hourly else round(raw / 500) * 500
+
+
+def _make_comp_row(comp_id, pid, pos_id, eff_date, amount,
+                   comp_type, reason, change_pct):
+    return {
+        "compensation_id":   comp_id,
+        "person_id":         pid,
+        "position_id":       pos_id,
+        "company_id":        COMPANY_ID,
+        "date_id":           to_date_id(eff_date),
+        "effective_date":    eff_date.isoformat(),
+        "base_amount":       amount,
+        "compensation_type": comp_type,
+        "change_reason":     reason,
+        "change_pct":        change_pct,
+        "is_current":        0,
+    }
+
+
+def build_fact_compensation(person_records: list,
+                             assignment_lookup: dict,
+                             pos_df: pd.DataFrame,
+                             date_id_set: set) -> pd.DataFrame:
+    """
+    Generate realistic compensation history for every person.
+      - Hire record on start date, amount based on job_level band
+      - Annual review each year: 2-6.5% merit / market increase
+      - Promotion year: 10-22% bump tied to position change
+      - Full-Time → Salary (annual $), Part-Time/Contractor → Hourly ($/hr)
+      - is_current = 1 on the latest record for active employees only
+    """
+    pos_map = pos_df.set_index("position_id").to_dict("index")
+    rows = []
+    comp_id = 1
+
+    for pr in person_records:
+        pid      = pr["person_id"]
+        hire     = pr["hire_date"]
+        term     = pr["term_date"]
+        emp_type = pr["emp_type"]
+        end_date = term if term else TODAY
+
+        comp_type = _COMP_TYPE.get(emp_type, "Salary")
+        is_hourly = comp_type in ("Hourly", "Contract Rate")
+
+        segs = assignment_lookup.get(pid, [])
+        if not segs:
+            continue
+
+        first_pos = pos_map.get(segs[0]["pos_id"], {})
+        job_level = first_pos.get("job_level", "Individual Contributor")
+        sal_lo, sal_hi = _SALARY_BANDS.get(job_level, (44000, 92000))
+
+        if is_hourly:
+            amount = round(random.uniform(sal_lo / 2080, sal_hi / 2080), 2)
+        else:
+            amount = round(random.uniform(sal_lo, sal_hi) / 500) * 500
+
+        # Hire record
+        if to_date_id(hire) in date_id_set:
+            rows.append(_make_comp_row(
+                comp_id, pid, segs[0]["pos_id"], hire,
+                amount, comp_type, "Hire", None
+            ))
+            comp_id += 1
+
+        prev_amount = amount
+        cur_level   = job_level
+        cur_pos_id  = segs[0]["pos_id"]
+
+        promotion_by_year = {seg["start"].year: seg for seg in segs[1:]}
+
+        for yr in range(hire.year + 1, end_date.year + 1):
+            review_date = date(yr, random.choice(_REVIEW_MONTH_POOL), random.randint(1, 28))
+            if review_date > end_date:
+                break
+            if to_date_id(review_date) not in date_id_set:
+                continue
+
+            if yr in promotion_by_year:
+                seg       = promotion_by_year[yr]
+                new_pos   = pos_map.get(seg["pos_id"], {})
+                new_level = new_pos.get("job_level", cur_level)
+                bump_pct  = round(random.uniform(0.10, 0.22), 4)
+                new_amount = _apply_comp_bump(prev_amount, bump_pct, is_hourly)
+                n_lo, _   = _SALARY_BANDS.get(new_level, (44000, 92000))
+                floor     = round(n_lo / 2080 * 0.90, 2) if is_hourly else round(n_lo * 0.90 / 500) * 500
+                new_amount = max(new_amount, floor)
+                rows.append(_make_comp_row(
+                    comp_id, pid, seg["pos_id"], review_date,
+                    new_amount, comp_type, "Promotion", round(bump_pct * 100, 1)
+                ))
+                cur_level  = new_level
+                cur_pos_id = seg["pos_id"]
+            else:
+                merit_pct  = round(random.uniform(0.02, 0.065), 4)
+                new_amount = _apply_comp_bump(prev_amount, merit_pct, is_hourly)
+                reason     = random.choice(["Annual Review", "Merit Increase", "Market Adjustment"])
+                rows.append(_make_comp_row(
+                    comp_id, pid, cur_pos_id, review_date,
+                    new_amount, comp_type, reason, round(merit_pct * 100, 1)
+                ))
+
+            comp_id    += 1
+            prev_amount = new_amount
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    # Mark is_current on latest record per active employee
+    active_pids = {pr["person_id"] for pr in person_records if not pr["term_date"]}
+    latest_idx  = (
+        df[df["person_id"].isin(active_pids)]
+        .groupby("person_id")["effective_date"]
+        .idxmax()
+    )
+    df.loc[latest_idx, "is_current"] = 1
+    return df
+
+
 # ── SQLite schema + load ──────────────────────────────────────────────────────
 
 DDL = """
@@ -934,7 +1099,8 @@ CREATE TABLE IF NOT EXISTS fact_position_assignment (
     company_id     INTEGER NOT NULL REFERENCES dim_company(company_id),
     effective_start TEXT NOT NULL,
     effective_end   TEXT,
-    is_current      INTEGER NOT NULL
+    is_current      INTEGER NOT NULL,
+    promotion_flag  INTEGER NOT NULL DEFAULT 0   -- 1 = level increased AND comp raise >=8%
 );
 
 CREATE TABLE IF NOT EXISTS fact_employment_event (
@@ -960,7 +1126,7 @@ CREATE TABLE IF NOT EXISTS fact_headcount_snapshot (
     location_id      INTEGER NOT NULL REFERENCES dim_work_location(location_id),
     company_id       INTEGER NOT NULL REFERENCES dim_company(company_id),
     is_active        INTEGER NOT NULL,
-    employment_type  TEXT NOT NULL,
+    employment_type  TEXT NOT NULL,   -- W2 Salaried | W2 Hourly | Contingent (1099) | Agency/Leased
     tenure_days      INTEGER NOT NULL,
     tenure_months    REAL NOT NULL,
     tenure_band      TEXT NOT NULL
@@ -1004,11 +1170,28 @@ CREATE TABLE IF NOT EXISTS fact_exit_interview (
     manager_rating_avg  REAL NOT NULL,
     voluntary_flag      INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS fact_compensation (
+    compensation_id   INTEGER PRIMARY KEY,
+    person_id         INTEGER NOT NULL REFERENCES dim_person(person_id),
+    position_id       INTEGER NOT NULL REFERENCES dim_position(position_id),
+    company_id        INTEGER NOT NULL REFERENCES dim_company(company_id),
+    date_id           INTEGER NOT NULL REFERENCES dim_date(date_id),
+    effective_date    TEXT    NOT NULL,
+    base_amount       REAL    NOT NULL,
+    compensation_type TEXT    NOT NULL,
+    change_reason     TEXT    NOT NULL,
+    change_pct        REAL,
+    is_current        INTEGER NOT NULL
+);
 """
 
 def load_to_sqlite(tables: dict):
     if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+        try:
+            os.remove(DB_PATH)
+        except PermissionError:
+            pass   # file locked or read-only mount — connect and overwrite in place
     con = sqlite3.connect(DB_PATH)
     con.executescript(DDL)
     for tname, df in tables.items():
@@ -1055,7 +1238,7 @@ def validate(tables: dict):
     print(f"  {'Year':<8} {'Terms':>6} {'Avg HC':>8} {'Rate':>8}")
     print("  " + "-" * 33)
     annual_rates = []
-    for yr in range(2019, 2026):
+    for yr in range(2019, 2027):
         yr_terms = events[
             (events["event_type"] == "Termination") &
             (events["event_date"].str[:4] == str(yr))
@@ -1154,6 +1337,12 @@ def main():
     )
     print(f"      fact_exit_interview: {len(fact_exit_interview):,} rows")
 
+    print("      fact_compensation: building...")
+    fact_compensation = build_fact_compensation(
+        person_records, assignment_lookup, dim_position, date_id_set
+    )
+    print(f"      fact_compensation: {len(fact_compensation):,} rows")
+
     # Ordered dict — dimensions first (for FK inserts)
     tables = {
         "dim_company":               dim_company,
@@ -1168,6 +1357,7 @@ def main():
         "fact_requisition":          fact_requisition,
         "fact_recruiting_pipeline":  fact_recruiting_pipeline,
         "fact_exit_interview":       fact_exit_interview,
+        "fact_compensation":         fact_compensation,
     }
 
     print("\n[3/5] Exporting CSVs...")
@@ -1175,6 +1365,12 @@ def main():
 
     print("\n[4/5] Loading to SQLite...")
     load_to_sqlite(tables)
+    import shutil
+    try:
+        shutil.copy2(DB_PATH, _FINAL_DB_PATH)
+        print(f"  \u2713 DB copied to {_FINAL_DB_PATH}")
+    except Exception as e:
+        print(f"  \u26a0 Could not copy DB: {e}")
 
     print("\n[5/5] Validating...")
     validate(tables)

@@ -32,3 +32,9 @@ Thumbs.db
 
 # Sensitive outputs
 outputs/*.db
+
+# Generated data outputs — never commit
+outputs/*.csv
+outputs/*.db
+
+*.db-journal
