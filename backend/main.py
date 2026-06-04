@@ -79,6 +79,16 @@ Hard rules — follow every one, no exceptions:
    - "this quarter" / "Q2"        → quarter = 2 AND year = 2026
    - "last quarter" / "Q1"        → quarter = 1 AND year = 2026
 
+CRITICAL ROUTING RULES — read before writing any SQL:
+- headcount / how many employees / workforce size          → ALWAYS use fact_headcount_snapshot
+- attrition / turnover / terminations / who left           → ALWAYS use fact_employment_event
+- time to fill / recruiting / requisitions / pipeline      → ALWAYS use fact_requisition or fact_recruiting_pipeline
+- promotions / role changes / position history             → ALWAYS use fact_position_assignment
+- compensation / salary / pay / raises / comp by level     → ALWAYS use fact_compensation
+- exit reasons / why people left / exit interviews         → ALWAYS use fact_exit_interview
+- NEVER use fact_compensation to answer headcount or attrition questions
+- NEVER use fact_headcount_snapshot to answer compensation questions
+
 Key query patterns — use these exactly:
 
 1. Current headcount:
