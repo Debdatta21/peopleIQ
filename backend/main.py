@@ -198,8 +198,16 @@ def call_groq(system_prompt: str, user_content: str) -> str:
         "temperature": 0.1,
         "max_tokens": 1024,
     }
-    resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
-    resp.raise_for_status()
+    import time
+    for attempt in range(3):
+        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+        if resp.status_code == 429:
+            wait = 20 * (attempt + 1)  # 20s, 40s, 60s
+            log.warning(f"Groq 429 rate limit — waiting {wait}s before retry {attempt+1}/3")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        break
     data = resp.json()
     usage = data.get("usage", {})
     log.info(
