@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -21,7 +21,89 @@ export default function Home() {
   const [loading, setLoading]         = useState(false);
   const [error, setError]             = useState(null);
   const [sqlExpanded, setSqlExpanded] = useState(false);
+  const [summary, setSummary]         = useState(null);
+  const [summaryLoading, setSummaryLoading] = useState(true);
+  const [chartData, setChartData]     = useState(null);
   const inputRef                      = useRef(null);
+  const chartRef                      = useRef(null);
+
+  // Load workforce brief on mount
+  useEffect(() => {
+    fetch(`${API_URL}/summary`)
+      .then(r => r.json())
+      .then(d => { setSummary(d.metrics); setSummaryLoading(false); })
+      .catch(() => setSummaryLoading(false));
+  }, []);
+
+  // Draw chart whenever chartData changes
+  useEffect(() => {
+    if (!chartData || !chartRef.current) return;
+    const canvas = chartRef.current;
+    const ctx    = canvas.getContext('2d');
+    const { labels, values, label, type } = chartData;
+    const W = canvas.width, H = canvas.height;
+    const PAD = { top: 20, right: 16, bottom: 48, left: 56 };
+    const chartW = W - PAD.left - PAD.right;
+    const chartH = H - PAD.top - PAD.bottom;
+    const maxVal = Math.max(...values) * 1.1 || 1;
+    const TEAL   = '#0D7377';
+    const TEAL_L = '#e6f4f5';
+    const GRAY   = '#6b7280';
+    const LGRAY  = '#e5e7eb';
+
+    ctx.clearRect(0, 0, W, H);
+
+    // Grid lines
+    ctx.strokeStyle = LGRAY;
+    ctx.lineWidth   = 0.5;
+    for (let i = 0; i <= 4; i++) {
+      const y = PAD.top + chartH - (i / 4) * chartH;
+      ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(PAD.left + chartW, y); ctx.stroke();
+      ctx.fillStyle = GRAY; ctx.font = '11px system-ui';
+      ctx.textAlign = 'right';
+      ctx.fillText(((maxVal / 1.1) * i / 4).toFixed(maxVal > 100 ? 0 : 1), PAD.left - 6, y + 3);
+    }
+
+    if (type === 'bar') {
+      const barW  = Math.min(chartW / labels.length * 0.6, 48);
+      const step  = chartW / labels.length;
+      values.forEach((v, i) => {
+        const x  = PAD.left + i * step + step / 2 - barW / 2;
+        const bH = (v / maxVal) * chartH;
+        const y  = PAD.top + chartH - bH;
+        ctx.fillStyle = TEAL_L;
+        ctx.fillRect(x, PAD.top, barW, chartH);
+        ctx.fillStyle = TEAL;
+        ctx.fillRect(x, y, barW, bH);
+        ctx.fillStyle = '#111827'; ctx.font = '11px system-ui'; ctx.textAlign = 'center';
+        const lbl = String(labels[i]).length > 10 ? String(labels[i]).slice(0,10)+'…' : String(labels[i]);
+        ctx.fillText(lbl, x + barW / 2, PAD.top + chartH + 14);
+      });
+    } else {
+      // Line chart
+      ctx.strokeStyle = TEAL; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+      ctx.beginPath();
+      values.forEach((v, i) => {
+        const x = PAD.left + (i / (values.length - 1)) * chartW;
+        const y = PAD.top + chartH - (v / maxVal) * chartH;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      values.forEach((v, i) => {
+        const x = PAD.left + (i / (values.length - 1)) * chartW;
+        const y = PAD.top + chartH - (v / maxVal) * chartH;
+        ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = TEAL; ctx.fill();
+        ctx.fillStyle = '#111827'; ctx.font = '11px system-ui'; ctx.textAlign = 'center';
+        const lbl = String(labels[i]).length > 8 ? String(labels[i]).slice(0,8)+'…' : String(labels[i]);
+        ctx.fillText(lbl, x, PAD.top + chartH + 14);
+      });
+    }
+
+    // Chart label
+    ctx.fillStyle = GRAY; ctx.font = '500 12px system-ui'; ctx.textAlign = 'left';
+    ctx.fillText(label, PAD.left, 13);
+  }, [chartData]);
 
   const handleChip = (q) => {
     setQuestion(q);
@@ -59,6 +141,7 @@ export default function Home() {
       setAnswer(data.answer);
       setSql(data.sql);
       setRowCount(data.row_count);
+      setChartData(data.chart_data || null);
     } catch (err) {
       setError(err.message || 'Something went wrong. Is the backend running?');
     } finally {
@@ -93,6 +176,43 @@ export default function Home() {
         <p style={styles.subheadline}>
           Natural language people analytics — powered by 500 synthetic employees across 7 years of generated HR data.
         </p>
+      </section>
+
+      {/* ── Workforce Brief ── */}
+      <section style={styles.briefSection}>
+        <div style={styles.briefHeader}>
+          <span style={styles.briefLabel}>Workforce brief</span>
+          <span style={styles.briefDate}>
+            {new Date().toLocaleDateString('en-US', { weekday:'long', year:'numeric', month:'long', day:'numeric' })}
+          </span>
+        </div>
+
+        {summaryLoading ? (
+          <div style={styles.briefSkeleton}>
+            {[...Array(6)].map((_, i) => (
+              <div key={i} style={styles.skeletonCard} />
+            ))}
+          </div>
+        ) : summary ? (
+          <div style={styles.briefGrid}>
+            {summary.map(m => (
+              <div key={m.key} style={{ ...styles.hCard, ...styles[`hCard_${m.status}`] }}>
+                <div style={{ ...styles.hStatus, ...styles[`hStatus_${m.status}`] }}>
+                  {m.status === 'good' ? 'All clear' : m.status === 'watch' ? 'Watch' : 'Needs attention'}
+                </div>
+                <div style={styles.hHeadline}>{m.headline}</div>
+                <div style={styles.hDetail}>{m.detail}</div>
+                <button
+                  style={styles.hBtn}
+                  onClick={() => { setQuestion(m.question); inputRef.current?.focus(); }}
+                  type="button"
+                >
+                  Ask about this ↗
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
       </section>
 
       {/* ── Search form ── */}
@@ -182,6 +302,18 @@ export default function Home() {
                   </>
                 );
               })()}
+
+              {/* Chart */}
+              {chartData && (
+                <div style={styles.chartWrapper}>
+                  <canvas
+                    ref={chartRef}
+                    width={700}
+                    height={220}
+                    style={styles.chartCanvas}
+                  />
+                </div>
+              )}
 
               {/* Row count pill */}
               {rowCount !== null && (
@@ -558,6 +690,110 @@ const styles = {
     lineHeight: 1.6,
     whiteSpace: 'pre-wrap',
     wordBreak: 'break-word',
+  },
+
+  /* ── Workforce Brief ── */
+  briefSection: {
+    width: '100%',
+    maxWidth: 760,
+    marginBottom: 28,
+  },
+  briefHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  briefLabel: {
+    fontSize: 11,
+    fontWeight: 600,
+    color: '#6b7280',
+    letterSpacing: '0.07em',
+    textTransform: 'uppercase',
+  },
+  briefDate: {
+    fontSize: 11,
+    color: '#9ca3af',
+  },
+  briefGrid: {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gap: 10,
+  },
+  briefSkeleton: {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gap: 10,
+  },
+  skeletonCard: {
+    height: 96,
+    background: '#f3f4f6',
+    borderRadius: 10,
+    animation: 'pulse 1.4s ease-in-out infinite',
+  },
+  hCard: {
+    background: '#fff',
+    border: '1px solid #e5e7eb',
+    borderRadius: 10,
+    padding: '14px 16px 12px',
+    borderLeft: '3px solid #e5e7eb',
+  },
+  hCard_good: {
+    borderLeftColor: TEAL,
+  },
+  hCard_watch: {
+    borderLeftColor: '#f59e0b',
+  },
+  hCard_alert: {
+    borderLeftColor: '#ef4444',
+  },
+  hStatus: {
+    fontSize: 10,
+    fontWeight: 600,
+    letterSpacing: '0.07em',
+    textTransform: 'uppercase',
+    marginBottom: 4,
+  },
+  hStatus_good: { color: TEAL },
+  hStatus_watch: { color: '#b45309' },
+  hStatus_alert: { color: '#dc2626' },
+  hHeadline: {
+    fontSize: 14,
+    fontWeight: 600,
+    color: '#111827',
+    lineHeight: 1.35,
+    marginBottom: 4,
+  },
+  hDetail: {
+    fontSize: 12,
+    color: '#6b7280',
+    lineHeight: 1.5,
+    marginBottom: 10,
+  },
+  hBtn: {
+    fontSize: 11,
+    color: TEAL,
+    background: '#e6f4f5',
+    border: `1px solid #b3dfe1`,
+    borderRadius: 20,
+    padding: '3px 10px',
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+    fontWeight: 500,
+  },
+
+  /* ── Chart ── */
+  chartWrapper: {
+    marginTop: 20,
+    borderTop: '1px solid #f3f4f6',
+    paddingTop: 16,
+    overflowX: 'auto',
+  },
+  chartCanvas: {
+    width: '100%',
+    maxWidth: 700,
+    height: 220,
+    display: 'block',
   },
 
   /* Footer */

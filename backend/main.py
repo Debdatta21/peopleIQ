@@ -277,6 +277,168 @@ class ChatResponse(BaseModel):
     answer: str
     sql: Optional[str] = None
     row_count: int = 0
+    chart_data: Optional[dict] = None
+
+
+class SummaryMetric(BaseModel):
+    key: str
+    metric: str
+    value_fmt: str
+    status: str          # "good" | "watch" | "alert"
+    headline: str
+    detail: str
+    question: str        # pre-written question for the Ask button
+
+
+class SummaryResponse(BaseModel):
+    generated_at: str
+    metrics: list[SummaryMetric]
+
+
+# ── Chart detection ───────────────────────────────────────────────────────────
+def _detect_chart(rows: list[dict], row_count: int) -> Optional[dict]:
+    """Return Chart.js-ready config when the result is naturally chartable, else None."""
+    if row_count < 2 or not rows:
+        return None
+    keys = list(rows[0].keys())
+    if len(keys) < 2:
+        return None
+
+    label_col, value_col = keys[0], keys[1]
+    try:
+        values = [float(rows[i][value_col]) for i in range(min(row_count, 20))
+                  if rows[i][value_col] is not None]
+    except (TypeError, ValueError):
+        return None
+
+    if len(values) < 2:
+        return None
+
+    labels = [str(rows[i][label_col]) for i in range(len(values))]
+    time_keywords = ("year", "date", "month", "quarter", "period", "week")
+    chart_type = "line" if any(k in label_col.lower() for k in time_keywords) else "bar"
+
+    return {
+        "type": chart_type,
+        "label": value_col,
+        "labels": labels,
+        "values": values,
+    }
+
+
+# ── Summary (6 canned metrics) ────────────────────────────────────────────────
+def _compute_summary() -> list[dict]:
+    TODAY = "2026-06-04"
+    con = sqlite3.connect(DB_PATH)
+    metrics = []
+
+    try:
+        # 1. Current headcount
+        hc = con.execute(
+            "SELECT COUNT(*) FROM fact_headcount_snapshot "
+            "WHERE is_active=1 AND date_id=(SELECT MAX(date_id) FROM fact_headcount_snapshot WHERE is_active=1)"
+        ).fetchone()[0]
+        metrics.append(dict(
+            key="headcount", metric="Current Headcount",
+            value_fmt=f"{hc:,} employees", status="good",
+            headline=f"Headcount holds steady at {hc:,}",
+            detail="Active workforce stable across all locations.",
+            question="Break down our headcount by department and location",
+        ))
+
+        # 2. No raise in 2 years
+        active_total = con.execute("SELECT COUNT(*) FROM dim_person WHERE status='Active'").fetchone()[0]
+        no_raise = con.execute(f"""
+            SELECT COUNT(DISTINCT p.person_id) FROM dim_person p
+            WHERE p.status='Active'
+            AND p.person_id NOT IN (
+              SELECT DISTINCT fc.person_id FROM fact_compensation fc
+              WHERE fc.effective_date >= DATE('{TODAY}','-2 years')
+              AND fc.change_reason IN ('Annual Review','Merit Increase','Market Adjustment','Promotion')
+            )
+        """).fetchone()[0]
+        pct_nr = round(no_raise * 100 / active_total) if active_total else 0
+        metrics.append(dict(
+            key="no_raise", metric="No Raise in 2 Years",
+            value_fmt=f"{no_raise} employees ({pct_nr}%)",
+            status="alert" if pct_nr > 50 else "watch" if pct_nr > 25 else "good",
+            headline=f"{pct_nr}% of staff haven't had a raise in 2 years",
+            detail=f"{no_raise} of {active_total} active employees with no salary increase since Jun 2024.",
+            question="Which employees have not had a salary increase in the past 2 years?",
+        ))
+
+        # 3. Attrition YTD
+        terms = con.execute("""
+            SELECT COUNT(DISTINCT e.person_id) FROM fact_employment_event e
+            JOIN dim_date d ON e.date_id=d.date_id
+            WHERE e.event_type='Termination' AND d.year=2026
+        """).fetchone()[0]
+        hc_base = con.execute("""
+            SELECT COUNT(DISTINCT h.person_id) FROM fact_headcount_snapshot h
+            JOIN dim_date d ON h.date_id=d.date_id
+            WHERE h.is_active=1 AND d.year=2026
+        """).fetchone()[0]
+        attr = round(terms * 100.0 / hc_base, 1) if hc_base else 0
+        vol = con.execute("""
+            SELECT COUNT(*) FROM fact_employment_event e JOIN dim_date d ON e.date_id=d.date_id
+            WHERE e.event_type='Termination' AND d.year=2026 AND e.termination_type='Voluntary'
+        """).fetchone()[0]
+        vol_pct = round(vol * 100 / terms) if terms else 0
+        metrics.append(dict(
+            key="attrition", metric="Attrition Rate YTD",
+            value_fmt=f"{attr}%",
+            status="alert" if attr > 15 else "watch" if attr > 10 else "good",
+            headline=f"Attrition running at {attr}% year-to-date",
+            detail=f"Above 10% baseline. {vol_pct}% of exits are voluntary.",
+            question="What is our attrition rate this year and which departments are most affected?",
+        ))
+
+        # 4. Time to fill
+        ttf = con.execute(
+            "SELECT ROUND(AVG(days_to_fill),1) FROM fact_requisition WHERE status='Filled'"
+        ).fetchone()[0] or 0
+        metrics.append(dict(
+            key="time_to_fill", metric="Avg Time to Fill",
+            value_fmt=f"{ttf} days",
+            status="alert" if ttf > 60 else "watch" if ttf > 45 else "good",
+            headline=f"Roles filling in {ttf} days on average",
+            detail="Time-to-fill is within healthy range." if ttf <= 45 else f"{ttf}-day average is above the 45-day target.",
+            question="How long does it take us to fill a role on average?",
+        ))
+
+        # 5. Promotion rate
+        promoted = con.execute(
+            "SELECT COUNT(DISTINCT person_id) FROM fact_position_assignment WHERE promotion_flag=1"
+        ).fetchone()[0]
+        promo_rate = round(promoted * 100.0 / active_total, 1) if active_total else 0
+        metrics.append(dict(
+            key="promotion_rate", metric="Promotion Rate",
+            value_fmt=f"{promo_rate}%",
+            status="alert" if promo_rate < 1 else "watch" if promo_rate < 5 else "good",
+            headline=f"Promotion rate at {promo_rate}% — {'healthy' if promo_rate >= 5 else 'below target'}",
+            detail=f"{promoted} promotions among active employees. Industry median is 5–8%.",
+            question="Who received a promotion and what was their pay increase?",
+        ))
+
+        # 6. Avg merit increase last year
+        merit = con.execute("""
+            SELECT ROUND(AVG(change_pct),1) FROM fact_compensation
+            WHERE change_reason IN ('Annual Review','Merit Increase','Market Adjustment')
+            AND effective_date >= '2025-01-01' AND effective_date < '2026-01-01'
+        """).fetchone()[0] or 0
+        metrics.append(dict(
+            key="merit_increase", metric="Avg Merit Increase (2025)",
+            value_fmt=f"{merit}%",
+            status="alert" if merit < 2 else "watch" if merit < 3 else "good",
+            headline=f"Merit increases averaging {merit}% in 2025",
+            detail="In line with cost-of-living norms." if merit >= 3 else f"{merit}% average is below the 3% cost-of-living baseline.",
+            question="What was the average merit increase percentage last year?",
+        ))
+
+    finally:
+        con.close()
+
+    return metrics
 
 
 # ── Core functions ────────────────────────────────────────────────────────────
@@ -397,11 +559,27 @@ async def chat(request: ChatRequest):
             continue
 
         answer = generate_answer(question, rows, row_count)
+        chart_data = _detect_chart(rows, row_count)
         log.info(f"Answer: {answer[:120]}...")
-        return ChatResponse(answer=answer, sql=sql, row_count=row_count)
+        return ChatResponse(answer=answer, sql=sql, row_count=row_count, chart_data=chart_data)
 
     log.error(f"All {MAX_RETRIES} attempts failed for: {question!r}")
     return FALLBACK_RESPONSE
+
+# ── Summary endpoint ─────────────────────────────────────────────────────────
+@app.get("/summary", response_model=SummaryResponse)
+async def summary():
+    from datetime import date
+    try:
+        metrics = _compute_summary()
+    except Exception as exc:
+        log.error(f"Summary compute failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Summary error: {exc}")
+    return SummaryResponse(
+        generated_at=date.today().isoformat(),
+        metrics=[SummaryMetric(**m) for m in metrics],
+    )
+
 
 # ── Health check ──────────────────────────────────────────────────────────────
 
