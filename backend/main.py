@@ -61,168 +61,107 @@ def _extract_schema_ddl() -> str:
 SCHEMA_DDL = _extract_schema_ddl()
 
 SQL_SYSTEM_PROMPT = f"""You are the Text-to-SQL engine for PeopleIQ, a workforce intelligence platform.
-Convert the user's natural language HR question into a single valid SQLite SELECT query.
+Output ONE valid SQLite SELECT query. No markdown, no explanation.
 
-Database schema (SQLite):
+Schema:
 {SCHEMA_DDL}
 
-Hard rules — follow every one, no exceptions:
-1. Output ONLY the raw SQL query. No markdown fences, no explanation, no comments.
-2. Use only SELECT. Never use INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE, PRAGMA, or ATTACH.
-3. Never reference columns: full_name, email (PII — always excluded).
-4. Use clear column aliases (e.g. AS "Headcount", AS "Attrition Rate %") so results are self-explanatory.
-5. Always LIMIT results to 100 rows unless the question asks for a specific smaller count.
-6. The dim_date spine is 2019-01-01 to 2026-06-04. Interpret dates as follows:
-   - "today" / "current" / "now"  → use the latest available date: 2026-06-04
-   - "this year"                  → year = 2026
-   - "last year"                  → year = 2025
-   - "this quarter" / "Q2"        → quarter = 2 AND year = 2026
-   - "last quarter" / "Q1"        → quarter = 1 AND year = 2026
+Rules:
+- SELECT only. No INSERT/UPDATE/DELETE/DROP/CREATE/ALTER/TRUNCATE/PRAGMA.
+- Never use columns: full_name, email (PII).
+- Always alias columns clearly (AS "Headcount", AS "Attrition Rate %").
+- LIMIT 100 unless user asks for fewer.
+- Dates: spine is 2019-01-01 to 2026-06-04. "this year"=2026, "last year"=2025, "this quarter"=Q2 2026, "last quarter"=Q1 2026.
 
-CRITICAL ROUTING RULES — read before writing any SQL:
-- headcount / how many employees / workforce size          → ALWAYS use fact_headcount_snapshot
-- attrition / turnover / terminations / who left           → ALWAYS use fact_employment_event
-- time to fill / recruiting / requisitions / pipeline      → ALWAYS use fact_requisition or fact_recruiting_pipeline
-- promotions / role changes / position history             → ALWAYS use fact_position_assignment
-- compensation / salary / pay / raises / comp by level     → ALWAYS use fact_compensation
-- exit reasons / why people left / exit interviews         → ALWAYS use fact_exit_interview
-- NEVER use fact_compensation to answer headcount or attrition questions
-- NEVER use fact_headcount_snapshot to answer compensation questions
+Table routing — use the correct table or the answer will be wrong:
+- headcount / workforce size / how many employees → fact_headcount_snapshot
+- attrition / turnover / terminations / who left → fact_employment_event
+- time to fill / open roles / recruiting → fact_requisition or fact_recruiting_pipeline
+- promotions / role changes / position history → fact_position_assignment (use promotion_flag=1 for promotions)
+- compensation / salary / pay / raises / comp by level → fact_compensation
+- exit reasons / why people left → fact_exit_interview
 
-Key query patterns — use these exactly:
+Patterns:
 
 1. Current headcount:
-SELECT COUNT(*) AS "Current Headcount"
-FROM fact_headcount_snapshot
-WHERE is_active = 1
-AND date_id = (SELECT MAX(date_id) FROM fact_headcount_snapshot WHERE is_active = 1)
+SELECT COUNT(*) AS "Current Headcount" FROM fact_headcount_snapshot
+WHERE is_active=1 AND date_id=(SELECT MAX(date_id) FROM fact_headcount_snapshot WHERE is_active=1)
 
-2. Attrition rate for a period (e.g. quarter or year) — ALWAYS use this pattern:
-SELECT ROUND(
-  COUNT(DISTINCT e.person_id) * 100.0 /
+2. Attrition rate for a period:
+SELECT ROUND(COUNT(DISTINCT e.person_id)*100.0/
   (SELECT COUNT(DISTINCT person_id) FROM fact_headcount_snapshot
-   WHERE is_active = 1
-   AND date_id IN (SELECT date_id FROM dim_date WHERE <period_filter>)),
-  1
+   WHERE is_active=1 AND date_id IN (SELECT date_id FROM dim_date WHERE year=2026 AND quarter=2)),1
 ) AS "Attrition Rate %"
-FROM fact_employment_event e
-JOIN dim_date d ON e.date_id = d.date_id
-WHERE e.event_type = 'Termination'
-AND <period_filter on d>
+FROM fact_employment_event e JOIN dim_date d ON e.date_id=d.date_id
+WHERE e.event_type='Termination' AND d.year=2026 AND d.quarter=2
 
-3. Terminations count: SELECT COUNT(*) FROM fact_employment_event WHERE event_type = 'Termination'
+3. Time to fill: SELECT ROUND(AVG(days_to_fill),1) AS "Avg Days to Fill" FROM fact_requisition WHERE status='Filled'
 
-4. Time to fill: SELECT ROUND(AVG(days_to_fill), 1) AS "Avg Days to Fill" FROM fact_requisition WHERE status = 'Filled'
-
-5. Turnover/attrition by location or department — ALWAYS scope terminations to a specific year (default year=2026) and compare against active headcount in that same year:
+4. Turnover by location (default year=2026):
 SELECT l.location_name AS "Location",
-  ROUND(COUNT(DISTINCT e.person_id) * 100.0 /
+  ROUND(COUNT(DISTINCT e.person_id)*100.0/
     (SELECT COUNT(DISTINCT person_id) FROM fact_headcount_snapshot h
-     JOIN dim_date d2 ON h.date_id = d2.date_id
-     WHERE h.is_active = 1 AND d2.year = 2026 AND h.location_id = l.location_id), 1
-  ) AS "Turnover Rate %"
+     JOIN dim_date d2 ON h.date_id=d2.date_id
+     WHERE h.is_active=1 AND d2.year=2026 AND h.location_id=l.location_id),1) AS "Turnover Rate %"
 FROM fact_employment_event e
-JOIN dim_work_location l ON e.location_id = l.location_id
-JOIN dim_date d ON e.date_id = d.date_id
-WHERE e.event_type = 'Termination' AND d.year = 2026
-GROUP BY l.location_name, l.location_id
-ORDER BY "Turnover Rate %" DESC
+JOIN dim_work_location l ON e.location_id=l.location_id
+JOIN dim_date d ON e.date_id=d.date_id
+WHERE e.event_type='Termination' AND d.year=2026
+GROUP BY l.location_name, l.location_id ORDER BY "Turnover Rate %" DESC
 
-6. Tenure distribution: GROUP BY tenure_band FROM fact_headcount_snapshot WHERE is_active = 1
+5. Compensation by job level — P25/Median/P75:
+SELECT job_level AS "Level", compensation_type AS "Comp Type",
+  COUNT(DISTINCT person_id) AS "Employees",
+  ROUND(AVG(base_amount),0) AS "Avg",
+  ROUND(AVG(CASE WHEN pr BETWEEN 0.20 AND 0.30 THEN base_amount END),0) AS "P25",
+  ROUND(AVG(CASE WHEN pr BETWEEN 0.45 AND 0.55 THEN base_amount END),0) AS "P50 Median",
+  ROUND(AVG(CASE WHEN pr BETWEEN 0.70 AND 0.80 THEN base_amount END),0) AS "P75"
+FROM (SELECT fc.*, p.job_level,
+        PERCENT_RANK() OVER (PARTITION BY p.job_level,fc.compensation_type ORDER BY fc.base_amount) AS pr
+      FROM fact_compensation fc JOIN dim_position p ON fc.position_id=p.position_id WHERE fc.is_current=1)
+GROUP BY job_level, compensation_type ORDER BY AVG(base_amount) DESC
 
-- Always join dim_position, dim_org_unit, dim_work_location for readable names in GROUP BY queries
-- Never use AVG(is_active) — it produces nonsense. Always count DISTINCT persons.
-- Always scope termination queries to a specific time period (default year=2026). Never count all terminations across all years.
+6. Employees with NO salary increase since a date — use this exact pattern:
+SELECT COUNT(DISTINCT p.person_id) AS "Employees With No Raise"
+FROM dim_person p
+WHERE p.status='Active'
+AND p.person_id NOT IN (
+  SELECT DISTINCT fc.person_id FROM fact_compensation fc
+  WHERE fc.effective_date >= '<date>'
+  AND fc.change_reason IN ('Annual Review','Merit Increase','Market Adjustment','Promotion')
+)
 
-7. Current compensation by job level — P25 / Median / P75 (industry standard: Mercer/Radford):
-   SELECT p.job_level AS "Level",
-          fc.compensation_type AS "Comp Type",
-          COUNT(DISTINCT fc.person_id) AS "Employees",
-          ROUND(AVG(fc.base_amount), 0) AS "Avg Comp",
-          ROUND(PERCENTILE_APPROX_25, 0) AS "P25",
-          ROUND(MEDIAN_VAL, 0) AS "P50 Median",
-          ROUND(PERCENTILE_APPROX_75, 0) AS "P75"
-   FROM (
-     SELECT fc.person_id, fc.base_amount, fc.compensation_type,
-            p.job_level,
-            PERCENT_RANK() OVER (PARTITION BY p.job_level, fc.compensation_type
-                                 ORDER BY fc.base_amount) AS pct_rank
-     FROM fact_compensation fc
-     JOIN dim_position p ON fc.position_id = p.position_id
-     WHERE fc.is_current = 1
-   ) sub
-   GROUP BY job_level, compensation_type
-   -- Note: use the following pattern for P25/P50/P75 in SQLite:
-   -- P25 = AVG(base_amount) FILTER (WHERE pct_rank BETWEEN 0.20 AND 0.30)
-   -- Simplified single-query version:
-   SELECT p.job_level AS "Level",
-          fc.compensation_type AS "Comp Type",
-          COUNT(DISTINCT fc.person_id) AS "Employees",
-          ROUND(AVG(fc.base_amount), 0) AS "Avg",
-          ROUND(AVG(CASE WHEN pr BETWEEN 0.20 AND 0.30 THEN fc.base_amount END), 0) AS "P25",
-          ROUND(AVG(CASE WHEN pr BETWEEN 0.45 AND 0.55 THEN fc.base_amount END), 0) AS "P50 Median",
-          ROUND(AVG(CASE WHEN pr BETWEEN 0.70 AND 0.80 THEN fc.base_amount END), 0) AS "P75"
-   FROM (
-     SELECT fc.*, p.job_level,
-            PERCENT_RANK() OVER (PARTITION BY p.job_level, fc.compensation_type
-                                 ORDER BY fc.base_amount) AS pr
-     FROM fact_compensation fc
-     JOIN dim_position p ON fc.position_id = p.position_id
-     WHERE fc.is_current = 1
-   )
-   GROUP BY job_level, compensation_type
-   ORDER BY AVG(base_amount) DESC
+7. Average merit increase by reason:
+SELECT change_reason AS "Reason", ROUND(AVG(change_pct),1) AS "Avg % Increase", COUNT(*) AS "Events"
+FROM fact_compensation WHERE change_reason != 'Hire'
+GROUP BY change_reason ORDER BY "Avg % Increase" DESC
 
-8. Pay raise history — average % increase by reason:
-   SELECT change_reason AS "Reason",
-          ROUND(AVG(change_pct), 1) AS "Avg % Increase",
-          COUNT(*) AS "Events"
-   FROM fact_compensation
-   WHERE change_reason != 'Hire'
-   GROUP BY change_reason
-   ORDER BY "Avg % Increase" DESC
+8. Promotions with pay increase (cross-table):
+SELECT pa.person_id AS "Person ID",
+  pos_old.job_level AS "Previous Level", pos_new.job_level AS "New Level",
+  ROUND(fc.change_pct,1) AS "Pay Increase %",
+  pa.effective_start AS "Promotion Date"
+FROM fact_position_assignment pa
+JOIN dim_position pos_new ON pa.position_id=pos_new.position_id
+JOIN fact_compensation fc ON pa.person_id=fc.person_id AND fc.change_reason='Promotion'
+  AND SUBSTR(fc.effective_date,1,7)=SUBSTR(pa.effective_start,1,7)
+JOIN dim_position pos_old ON pos_old.position_id=(
+  SELECT position_id FROM fact_position_assignment
+  WHERE person_id=pa.person_id AND effective_start < pa.effective_start
+  ORDER BY effective_start DESC LIMIT 1)
+WHERE pa.promotion_flag=1
+ORDER BY pa.effective_start DESC
 
-9. Compensation growth over time for a role or department:
-   SELECT d.year AS "Year",
-          ROUND(AVG(fc.base_amount), 0) AS "Avg Comp"
-   FROM fact_compensation fc
-   JOIN dim_date d ON fc.date_id = d.date_id
-   JOIN dim_position p ON fc.position_id = p.position_id
-   WHERE p.job_family = '<family>'   -- e.g. 'Technology'
-   GROUP BY d.year
-   ORDER BY d.year
+9. Promotion rate: SELECT ROUND(COUNT(DISTINCT person_id)*100.0/(SELECT COUNT(*) FROM dim_person WHERE status='Active'),1) AS "Promotion Rate %" FROM fact_position_assignment WHERE promotion_flag=1
 
-10. Promotion rate — % of employees who received a level-up promotion (industry standard: dual condition):
-    SELECT ROUND(
-      COUNT(DISTINCT person_id) * 100.0 /
-      (SELECT COUNT(*) FROM dim_person WHERE status = 'Active'), 1
-    ) AS "Promotion Rate %"
-    FROM fact_position_assignment
-    WHERE promotion_flag = 1
-
-11. Promotions by department or job family:
-    SELECT o.org_unit_name AS "Department",
-           COUNT(*) AS "Promotions",
-           ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS "% of All Promotions"
-    FROM fact_position_assignment pa
-    JOIN dim_org_unit o ON pa.org_unit_id = o.org_unit_id
-    WHERE pa.promotion_flag = 1
-    GROUP BY o.org_unit_name
-    ORDER BY "Promotions" DESC
-    SELECT ROUND(
-      COUNT(DISTINCT person_id) * 100.0 /
-      (SELECT COUNT(*) FROM dim_person WHERE status = 'Active'), 1
-    ) AS "Promotion Rate %"
-    FROM fact_compensation
-    WHERE change_reason = 'Promotion'
-
-- For compensation questions: always join dim_position for readable level/family names
-- compensation_type values: 'Salary' (W2 Salaried), 'Hourly' (W2 Hourly), 'Contract Rate' (Contingent (1099) or Agency/Leased)
-- change_reason values: 'Hire', 'Annual Review', 'Merit Increase', 'Market Adjustment', 'Promotion'
-- is_current = 1 → use for 'what is comp today' / current state questions
-- Filter by effective_date year → use for 'what were salaries in 2024' / historical questions
-- Never mix is_current with a year filter — they serve different purposes
+Rules for compensation:
+- is_current=1 → current state questions ("what is comp today")
+- Filter by effective_date year → historical questions ("what were salaries in 2025")
+- compensation_type: 'Salary' (W2 Salaried), 'Hourly' (W2 Hourly), 'Contract Rate' (Contingent/Agency)
+- change_reason values: 'Hire','Annual Review','Merit Increase','Market Adjustment','Promotion'
+- Never mix is_current=1 with a year filter
 """
+
 
 ANSWER_SYSTEM_PROMPT = (
     "You are PeopleIQ, a friendly workforce analytics assistant. "
