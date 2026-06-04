@@ -35,9 +35,12 @@ export default function Home() {
       .catch(() => setSummaryLoading(false));
   }, []);
 
-  // Draw chart whenever chartData changes
+  // Draw chart — runs after chartData AND after canvas is guaranteed in DOM
   useEffect(() => {
     if (!chartData || !chartRef.current) return;
+    // Small defer to ensure canvas is painted before we draw
+    const id = setTimeout(() => {
+    if (!chartRef.current) return;
     const canvas = chartRef.current;
     const ctx    = canvas.getContext('2d');
     const { labels, values, label, type } = chartData;
@@ -103,6 +106,8 @@ export default function Home() {
     // Chart label
     ctx.fillStyle = GRAY; ctx.font = '500 12px system-ui'; ctx.textAlign = 'left';
     ctx.fillText(label, PAD.left, 13);
+    }, 0);
+    return () => clearTimeout(id);
   }, [chartData]);
 
   const handleChip = (q) => {
@@ -303,17 +308,15 @@ export default function Home() {
                 );
               })()}
 
-              {/* Chart */}
-              {chartData && (
-                <div style={styles.chartWrapper}>
-                  <canvas
-                    ref={chartRef}
-                    width={700}
-                    height={220}
-                    style={styles.chartCanvas}
-                  />
-                </div>
-              )}
+              {/* Chart — always rendered so ref is always attached; hidden when no data */}
+              <div style={{ ...styles.chartWrapper, display: chartData ? 'block' : 'none' }}>
+                <canvas
+                  ref={chartRef}
+                  width={700}
+                  height={220}
+                  style={styles.chartCanvas}
+                />
+              </div>
 
               {/* Row count pill */}
               {rowCount !== null && (

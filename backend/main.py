@@ -297,24 +297,53 @@ class SummaryResponse(BaseModel):
 
 # ── Chart detection ───────────────────────────────────────────────────────────
 def _detect_chart(rows: list[dict], row_count: int) -> Optional[dict]:
-    """Return Chart.js-ready config when the result is naturally chartable, else None."""
+    """Return chart config when the result is naturally chartable, else None.
+    Scans all columns to find the best label (first string col) and best
+    value (first numeric col that comes after a string col, or any numeric col).
+    """
     if row_count < 2 or not rows:
         return None
     keys = list(rows[0].keys())
     if len(keys) < 2:
         return None
 
-    label_col, value_col = keys[0], keys[1]
+    sample = rows[0]
+
+    # Find first string-ish column → use as X-axis labels
+    label_col = None
+    for k in keys:
+        v = sample.get(k)
+        if isinstance(v, str) or (v is not None and not isinstance(v, (int, float))):
+            label_col = k
+            break
+    if label_col is None:
+        label_col = keys[0]          # fall back to first column
+
+    # Find first numeric column that is NOT the label column → Y-axis values
+    value_col = None
+    for k in keys:
+        if k == label_col:
+            continue
+        try:
+            float(rows[0][k])
+            value_col = k
+            break
+        except (TypeError, ValueError):
+            continue
+    if value_col is None:
+        return None
+
+    # Extract values (up to 20 rows)
     try:
-        values = [float(rows[i][value_col]) for i in range(min(row_count, 20))
-                  if rows[i][value_col] is not None]
+        sample_rows = rows[:20]
+        values = [float(r[value_col]) for r in sample_rows if r[value_col] is not None]
+        labels = [str(r[label_col]) for r in sample_rows[:len(values)]]
     except (TypeError, ValueError):
         return None
 
     if len(values) < 2:
         return None
 
-    labels = [str(rows[i][label_col]) for i in range(len(values))]
     time_keywords = ("year", "date", "month", "quarter", "period", "week")
     chart_type = "line" if any(k in label_col.lower() for k in time_keywords) else "bar"
 
