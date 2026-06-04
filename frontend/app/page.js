@@ -49,6 +49,9 @@ export default function Home() {
 
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
+        if (res.status === 429) {
+          throw new Error('⏳ Groq is rate-limited right now. Wait 30–60 seconds and try again.');
+        }
         throw new Error(detail?.detail || `Server error ${res.status}`);
       }
 

@@ -29,7 +29,7 @@ log = logging.getLogger("peopleiq")
 # ── Config ────────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "llama-3.1-8b-instant"   # 20k TPM free tier vs 6k for 70b — far fewer 429s
 MAX_RETRIES = 3
 
 DB_PATH = os.getenv(
@@ -199,15 +199,24 @@ def call_groq(system_prompt: str, user_content: str) -> str:
         "max_tokens": 1024,
     }
     import time
+    resp = None
     for attempt in range(3):
         resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
         if resp.status_code == 429:
-            wait = 20 * (attempt + 1)  # 20s, 40s, 60s
-            log.warning(f"Groq 429 rate limit — waiting {wait}s before retry {attempt+1}/3")
+            # Honour Groq's Retry-After header when present; else back off 20/40/60s
+            retry_after = resp.headers.get("Retry-After")
+            wait = int(retry_after) if retry_after and retry_after.isdigit() else 20 * (attempt + 1)
+            log.warning(f"Groq 429 rate limit — waiting {wait}s (attempt {attempt+1}/3)")
             time.sleep(wait)
             continue
         resp.raise_for_status()
         break
+    else:
+        # All 3 retries exhausted on 429 — surface a clean error instead of crashing
+        raise HTTPException(
+            status_code=429,
+            detail="Groq rate limit reached. Please wait 30–60 seconds and try again.",
+        )
     data = resp.json()
     usage = data.get("usage", {})
     log.info(
@@ -337,6 +346,8 @@ async def chat(request: ChatRequest):
         log.info(f"[attempt {attempt}/{MAX_RETRIES}] Generating SQL for: {question!r}")
         try:
             sql = generate_sql(question, error_context)
+        except HTTPException:
+            raise  # propagate 429 / 503 directly — don't wrap in 502
         except Exception as exc:
             log.error(f"Groq call failed: {exc}")
             raise HTTPException(status_code=502, detail=f"Groq API error: {exc}")
