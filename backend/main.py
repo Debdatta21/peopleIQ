@@ -368,4 +368,22 @@ async def chat(request: ChatRequest):
             log.warning(f"Attempt {attempt}: execute failed — {exc}")
             continue
 
-        answer = genera
+        answer = generate_answer(question, rows, row_count)
+        log.info(f"Answer: {answer[:120]}...")
+        return ChatResponse(answer=answer, sql=sql, row_count=row_count)
+
+    log.error(f"All {MAX_RETRIES} attempts failed for: {question!r}")
+    return FALLBACK_RESPONSE
+
+# ── Health check ──────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    db_exists = os.path.exists(DB_PATH)
+    table_count = len(re.findall(r"CREATE TABLE", SCHEMA_DDL, re.IGNORECASE))
+    return {
+        "status": "ok",
+        "db_exists": db_exists,
+        "schema_tables_loaded": table_count,
+        "model": MODEL,
+    }
