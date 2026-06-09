@@ -283,17 +283,18 @@ export default function Home() {
         </span>
       </div>
 
-      {/* ── Hero + brief: visible only before first question ── */}
+      {/* ── Hero: hidden once chat starts ── */}
       {messages.length === 0 && (
-        <>
-          <section style={styles.hero}>
-            <h1 style={styles.h1}>Ask anything about your workforce.</h1>
-            <p style={styles.subheadline}>
-              Natural language people analytics — powered by 500 synthetic employees across 7 years of generated HR data.
-            </p>
-          </section>
+        <section style={styles.hero}>
+          <h1 style={styles.h1}>Ask anything about your workforce.</h1>
+          <p style={styles.subheadline}>
+            Natural language people analytics — powered by 500 synthetic employees across 7 years of generated HR data.
+          </p>
+        </section>
+      )}
 
-          <section style={styles.briefSection}>
+      {/* ── Workforce brief: always visible ── */}
+      <section style={styles.briefSection}>
             <div style={styles.briefHeader}>
               <span style={styles.briefLabel}>Workforce brief</span>
               <span style={styles.briefDate}>
@@ -325,9 +326,7 @@ export default function Home() {
                 ))}
               </div>
             ) : null}
-          </section>
-        </>
-      )}
+      </section>
 
       {/* ── Chat thread ── */}
       {messages.length > 0 && (
