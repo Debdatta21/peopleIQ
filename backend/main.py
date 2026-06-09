@@ -13,6 +13,8 @@ import os
 import re
 import sqlite3
 import logging
+import time
+import json
 from typing import Optional
 
 import requests
@@ -42,6 +44,44 @@ DB_PATH = os.getenv(
 )
 
 PII_COLUMNS = {"full_name", "email", "first_name", "last_name"}
+
+# ── Query log setup ───────────────────────────────────────────────────────────
+def _init_query_log():
+    """Create query_log table if it doesn't exist."""
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS query_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            asked_at    TEXT    NOT NULL,
+            question    TEXT    NOT NULL,
+            sql_generated TEXT,
+            row_count   INTEGER,
+            success     INTEGER NOT NULL DEFAULT 1,
+            error_msg   TEXT,
+            latency_ms  INTEGER,
+            chart_data  TEXT
+        )
+    """)
+    con.commit()
+    con.close()
+
+
+def _log_query(question: str, sql: Optional[str], row_count: int,
+               success: bool, error_msg: Optional[str],
+               latency_ms: int, chart_data: Optional[dict]):
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            """INSERT INTO query_log
+               (asked_at, question, sql_generated, row_count, success, error_msg, latency_ms, chart_data)
+               VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?)""",
+            (question, sql, row_count, 1 if success else 0, error_msg,
+             latency_ms, json.dumps(chart_data) if chart_data else None)
+        )
+        con.commit()
+        con.close()
+    except Exception as exc:
+        log.warning(f"Failed to write query_log: {exc}")
 
 # ── Schema extraction ─────────────────────────────────────────────────────────
 # Compact schema — table(columns) only. Saves ~1000 tokens vs full DDL.
@@ -258,7 +298,10 @@ def call_groq(system_prompt: str, user_content: str) -> str:
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="PeopleIQ API", version="2.3.0")
+app = FastAPI(title="PeopleIQ API", version="2.4.0")
+
+# Ensure query_log table exists on startup
+_init_query_log()
 
 app.add_middleware(
     CORSMiddleware,
@@ -566,11 +609,15 @@ async def chat(request: ChatRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
+    t_start = time.monotonic()
     error_context = ""
+    last_sql = None
+
     for attempt in range(1, MAX_RETRIES + 1):
         log.info(f"[attempt {attempt}/{MAX_RETRIES}] Generating SQL for: {question!r}")
         try:
             sql = generate_sql(question, error_context)
+            last_sql = sql
         except HTTPException:
             raise  # propagate 429 / 503 directly — don't wrap in 502
         except Exception as exc:
@@ -593,10 +640,14 @@ async def chat(request: ChatRequest):
 
         answer = generate_answer(question, rows, row_count)
         chart_data = _detect_chart(rows, row_count)
-        log.info(f"Answer: {answer[:120]}...")
+        latency_ms = int((time.monotonic() - t_start) * 1000)
+        log.info(f"Answer: {answer[:120]}... ({latency_ms}ms)")
+        _log_query(question, sql, row_count, True, None, latency_ms, chart_data)
         return ChatResponse(answer=answer, sql=sql, row_count=row_count, chart_data=chart_data)
 
+    latency_ms = int((time.monotonic() - t_start) * 1000)
     log.error(f"All {MAX_RETRIES} attempts failed for: {question!r}")
+    _log_query(question, last_sql, 0, False, error_context or "All retries failed", latency_ms, None)
     return FALLBACK_RESPONSE
 
 # ── Summary endpoint ─────────────────────────────────────────────────────────
@@ -612,6 +663,58 @@ async def summary():
         generated_at=date.today().isoformat(),
         metrics=[SummaryMetric(**m) for m in metrics],
     )
+
+
+# ── Admin endpoints ───────────────────────────────────────────────────────────
+
+@app.get("/admin/logs")
+async def admin_logs(limit: int = 200, offset: int = 0):
+    """Return query log entries, newest first."""
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            """SELECT id, asked_at, question, sql_generated, row_count,
+                      success, error_msg, latency_ms, chart_data
+               FROM query_log
+               ORDER BY id DESC
+               LIMIT ? OFFSET ?""",
+            (limit, offset)
+        ).fetchall()
+        total = con.execute("SELECT COUNT(*) FROM query_log").fetchone()[0]
+    finally:
+        con.close()
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "logs": [dict(r) for r in rows],
+    }
+
+
+@app.get("/admin/stats")
+async def admin_stats():
+    """Aggregate stats for the admin dashboard."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        total      = con.execute("SELECT COUNT(*) FROM query_log").fetchone()[0]
+        successes  = con.execute("SELECT COUNT(*) FROM query_log WHERE success=1").fetchone()[0]
+        avg_lat    = con.execute("SELECT ROUND(AVG(latency_ms),0) FROM query_log WHERE success=1").fetchone()[0] or 0
+        avg_rows   = con.execute("SELECT ROUND(AVG(row_count),1) FROM query_log WHERE success=1").fetchone()[0] or 0
+        today      = con.execute(
+            "SELECT COUNT(*) FROM query_log WHERE asked_at >= date('now')"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    return {
+        "total_queries": total,
+        "success_count": successes,
+        "fail_count": total - successes,
+        "success_rate_pct": round(successes * 100 / total, 1) if total else 0,
+        "avg_latency_ms": int(avg_lat),
+        "avg_row_count": avg_rows,
+        "queries_today": today,
+    }
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
