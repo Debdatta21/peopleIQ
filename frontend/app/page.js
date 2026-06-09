@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect, useCallback } from 'react';
+import * as d3 from 'd3';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -13,87 +14,157 @@ const EXAMPLE_QUESTIONS = [
   'How many people left within their first 90 days?',
 ];
 
-// ── Chart renderer (pure function, called per-message) ────────────────────────
-function drawChart(canvas, chartData) {
-  if (!canvas || !chartData) return;
-  const ctx    = canvas.getContext('2d');
-  const { labels, values, label, type } = chartData;
-  const W = canvas.width, H = canvas.height;
-  const PAD = { top: 20, right: 16, bottom: 48, left: 56 };
-  const chartW = W - PAD.left - PAD.right;
-  const chartH = H - PAD.top - PAD.bottom;
-  const maxVal = Math.max(...values) * 1.1 || 1;
-  const TEAL   = '#0D7377';
-  const TEAL_L = '#e6f4f5';
-  const GRAY   = '#6b7280';
-  const LGRAY  = '#e5e7eb';
+// ── D3 Chart component ────────────────────────────────────────────────────────
+const CHART_COLORS = ['#0D7377', '#f59e0b', '#6366f1', '#ef4444', '#10b981'];
 
-  ctx.clearRect(0, 0, W, H);
+function D3Chart({ data }) {
+  const containerRef = useRef(null);
 
-  // Grid lines
-  ctx.strokeStyle = LGRAY; ctx.lineWidth = 0.5;
-  for (let i = 0; i <= 4; i++) {
-    const y = PAD.top + chartH - (i / 4) * chartH;
-    ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(PAD.left + chartW, y); ctx.stroke();
-    ctx.fillStyle = GRAY; ctx.font = '11px system-ui'; ctx.textAlign = 'right';
-    ctx.fillText(((maxVal / 1.1) * i / 4).toFixed(maxVal > 100 ? 0 : 1), PAD.left - 6, y + 3);
-  }
+  useEffect(() => {
+    if (!data || !containerRef.current) return;
+    const el = containerRef.current;
+    d3.select(el).selectAll('*').remove();
 
-  if (type === 'bar') {
-    const barW = Math.min(chartW / labels.length * 0.6, 48);
-    const step = chartW / labels.length;
-    values.forEach((v, i) => {
-      const x  = PAD.left + i * step + step / 2 - barW / 2;
-      const bH = (v / maxVal) * chartH;
-      const y  = PAD.top + chartH - bH;
-      ctx.fillStyle = TEAL_L; ctx.fillRect(x, PAD.top, barW, chartH);
-      ctx.fillStyle = TEAL;   ctx.fillRect(x, y, barW, bH);
-      ctx.fillStyle = '#111827'; ctx.font = '11px system-ui'; ctx.textAlign = 'center';
-      const lbl = String(labels[i]).length > 10 ? String(labels[i]).slice(0, 10) + '…' : String(labels[i]);
-      ctx.fillText(lbl, x + barW / 2, PAD.top + chartH + 14);
-    });
-  } else {
-    ctx.strokeStyle = TEAL; ctx.lineWidth = 2; ctx.lineJoin = 'round';
-    ctx.beginPath();
-    values.forEach((v, i) => {
-      const x = PAD.left + (i / (values.length - 1)) * chartW;
-      const y = PAD.top + chartH - (v / maxVal) * chartH;
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-    });
-    ctx.stroke();
-    values.forEach((v, i) => {
-      const x = PAD.left + (i / (values.length - 1)) * chartW;
-      const y = PAD.top + chartH - (v / maxVal) * chartH;
-      ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2);
-      ctx.fillStyle = TEAL; ctx.fill();
-      ctx.fillStyle = '#111827'; ctx.font = '11px system-ui'; ctx.textAlign = 'center';
-      const lbl = String(labels[i]).length > 8 ? String(labels[i]).slice(0, 8) + '…' : String(labels[i]);
-      ctx.fillText(lbl, x, PAD.top + chartH + 14);
-    });
-  }
+    const { type, labels, series } = data;
+    const M = { top: 24, right: 24, bottom: 48, left: 56 };
+    const totalW = el.clientWidth || 660;
+    const totalH = series.length > 1 ? 280 : 260;
+    const W = totalW - M.left - M.right;
+    const H = totalH - M.top - M.bottom - (series.length > 1 ? 24 : 0);
 
-  ctx.fillStyle = GRAY; ctx.font = '500 12px system-ui'; ctx.textAlign = 'left';
-  ctx.fillText(label, PAD.left, 13);
+    const svg = d3.select(el)
+      .append('svg')
+      .attr('width', totalW)
+      .attr('height', totalH)
+      .attr('xmlns', 'http://www.w3.org/2000/svg');
+
+    const g = svg.append('g').attr('transform', `translate(${M.left},${M.top})`);
+
+    const allVals = series.flatMap(s => s.values);
+    const yMax = (d3.max(allVals) || 1) * 1.12;
+
+    const y = d3.scaleLinear().domain([0, yMax]).range([H, 0]).nice();
+
+    // Y axis with grid
+    g.append('g')
+      .call(d3.axisLeft(y)
+        .ticks(4)
+        .tickSize(-W)
+        .tickFormat(v => v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v)
+      )
+      .call(ax => ax.select('.domain').remove())
+      .call(ax => ax.selectAll('.tick line').attr('stroke', '#e5e7eb').attr('stroke-dasharray', '3,3'))
+      .call(ax => ax.selectAll('.tick text').attr('fill', '#6b7280').attr('font-size', '11px'));
+
+    if (type === 'bar') {
+      const x = d3.scaleBand().domain(labels).range([0, W]).paddingInner(0.28).paddingOuter(0.1);
+      const xSub = d3.scaleBand().domain(series.map(s => s.name)).range([0, x.bandwidth()]).padding(0.06);
+
+      series.forEach((s, si) => {
+        const color = CHART_COLORS[si % CHART_COLORS.length];
+        g.selectAll(null)
+          .data(labels)
+          .enter().append('rect')
+          .attr('x', d => x(d) + xSub(s.name))
+          .attr('y', (d, i) => y(s.values[i]))
+          .attr('width', xSub.bandwidth())
+          .attr('height', (d, i) => Math.max(0, H - y(s.values[i])))
+          .attr('fill', color)
+          .attr('rx', 3);
+      });
+
+      g.append('g')
+        .attr('transform', `translate(0,${H})`)
+        .call(d3.axisBottom(x).tickSize(0))
+        .call(ax => ax.select('.domain').attr('stroke', '#e5e7eb'))
+        .call(ax => ax.selectAll('.tick text')
+          .attr('fill', '#6b7280').attr('font-size', '11px')
+          .text(d => String(d).length > 12 ? String(d).slice(0, 12) + '…' : d));
+
+    } else {
+      // Line chart
+      const x = d3.scalePoint().domain(labels).range([0, W]).padding(0.15);
+
+      series.forEach((s, si) => {
+        const color = CHART_COLORS[si % CHART_COLORS.length];
+
+        // Area fill for single series
+        if (series.length === 1) {
+          const area = d3.area()
+            .x((d, i) => x(labels[i]))
+            .y0(H).y1(d => y(d))
+            .curve(d3.curveMonotoneX);
+          g.append('path').datum(s.values)
+            .attr('fill', color).attr('opacity', 0.08)
+            .attr('d', area);
+        }
+
+        // Line
+        const line = d3.line()
+          .x((d, i) => x(labels[i])).y(d => y(d))
+          .curve(d3.curveMonotoneX);
+        g.append('path').datum(s.values)
+          .attr('fill', 'none').attr('stroke', color)
+          .attr('stroke-width', 2.5).attr('d', line);
+
+        // Dots
+        g.selectAll(null).data(s.values).enter().append('circle')
+          .attr('cx', (d, i) => x(labels[i])).attr('cy', d => y(d))
+          .attr('r', 4).attr('fill', color)
+          .attr('stroke', '#fff').attr('stroke-width', 2);
+      });
+
+      g.append('g')
+        .attr('transform', `translate(0,${H})`)
+        .call(d3.axisBottom(x).tickSize(0))
+        .call(ax => ax.select('.domain').attr('stroke', '#e5e7eb'))
+        .call(ax => ax.selectAll('.tick text')
+          .attr('fill', '#6b7280').attr('font-size', '11px'));
+    }
+
+    // Legend for multi-series
+    if (series.length > 1) {
+      const legendY = totalH - 20;
+      const legend = svg.append('g').attr('transform', `translate(${M.left},${legendY})`);
+      series.forEach((s, si) => {
+        const lx = si * 150;
+        legend.append('rect').attr('x', lx).attr('y', 0)
+          .attr('width', 10).attr('height', 10).attr('rx', 2)
+          .attr('fill', CHART_COLORS[si % CHART_COLORS.length]);
+        legend.append('text').attr('x', lx + 14).attr('y', 9)
+          .attr('font-size', '11px').attr('fill', '#6b7280')
+          .text(s.name.length > 18 ? s.name.slice(0, 18) + '…' : s.name);
+      });
+    }
+  }, [data]);
+
+  const downloadSVG = () => {
+    const svgEl = containerRef.current?.querySelector('svg');
+    if (!svgEl) return;
+    const serializer = new XMLSerializer();
+    const svgStr = serializer.serializeToString(svgEl);
+    const blob = new Blob([svgStr], { type: 'image/svg+xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `peopleiq-chart-${Date.now()}.svg`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div style={styles.chartWrapper}>
+      <div ref={containerRef} style={{ width: '100%' }} />
+      <button onClick={downloadSVG} style={styles.downloadBtn} type="button">
+        ↓ Download chart
+      </button>
+    </div>
+  );
 }
 
 // ── Single message bubble ─────────────────────────────────────────────────────
 function MessageBubble({ msg }) {
   const [sqlExpanded, setSqlExpanded] = useState(false);
-  const canvasRef = useRef(null);
-
-  useEffect(() => {
-    if (!msg.chartData || !canvasRef.current) return;
-    const id = setTimeout(() => drawChart(canvasRef.current, msg.chartData), 0);
-    return () => clearTimeout(id);
-  }, [msg.chartData]);
-
-  const downloadChart = () => {
-    if (!canvasRef.current) return;
-    const a = document.createElement('a');
-    a.href = canvasRef.current.toDataURL('image/png');
-    a.download = `peopleiq-chart-${Date.now()}.png`;
-    a.click();
-  };
 
   return (
     <div style={styles.messageGroup}>
@@ -139,14 +210,7 @@ function MessageBubble({ msg }) {
               })()}
 
               {/* Chart */}
-              {msg.chartData && (
-                <div style={styles.chartWrapper}>
-                  <canvas ref={canvasRef} width={660} height={220} style={styles.chartCanvas} />
-                  <button onClick={downloadChart} style={styles.downloadBtn} type="button">
-                    ↓ Download chart
-                  </button>
-                </div>
-              )}
+              {msg.chartData && <D3Chart data={msg.chartData} />}
 
               {/* Meta row */}
               <div style={styles.metaRow}>
@@ -535,7 +599,6 @@ const styles = {
 
   /* Chart */
   chartWrapper: { marginTop: 16, borderTop: '1px solid #f3f4f6', paddingTop: 14 },
-  chartCanvas: { width: '100%', maxWidth: 660, height: 220, display: 'block' },
   downloadBtn: {
     marginTop: 8, fontSize: 12, color: '#6b7280',
     background: 'none', border: '1px solid #e5e7eb', borderRadius: 6,

@@ -341,8 +341,8 @@ class SummaryResponse(BaseModel):
 # ── Chart detection ───────────────────────────────────────────────────────────
 def _detect_chart(rows: list[dict], row_count: int) -> Optional[dict]:
     """Return chart config when the result is naturally chartable, else None.
-    Scans all columns to find the best label (first string col) and best
-    value (first numeric col that comes after a string col, or any numeric col).
+    Supports multi-series: finds all numeric columns after the label column.
+    Returns: { type, labels, series: [{ name, values }] }
     """
     if row_count < 2 or not rows:
         return None
@@ -352,7 +352,7 @@ def _detect_chart(rows: list[dict], row_count: int) -> Optional[dict]:
 
     sample = rows[0]
 
-    # Find first string-ish column → use as X-axis labels
+    # Find first string-ish column → X-axis labels
     label_col = None
     for k in keys:
         v = sample.get(k)
@@ -360,35 +360,38 @@ def _detect_chart(rows: list[dict], row_count: int) -> Optional[dict]:
             label_col = k
             break
     if label_col is None:
-        label_col = keys[0]          # fall back to first column
+        label_col = keys[0]
 
-    # Find first meaningful numeric column (skip ID/key columns) → Y-axis values
     def _is_id_col(k: str) -> bool:
         kl = k.lower().strip()
         return kl == "id" or kl.endswith(" id") or kl.endswith("_id") or kl == "person id"
 
-    value_col = None
+    # Find ALL meaningful numeric columns → one series each
+    value_cols = []
     for k in keys:
         if k == label_col or _is_id_col(k):
             continue
         try:
             float(rows[0][k])
-            value_col = k
-            break
+            value_cols.append(k)
         except (TypeError, ValueError):
             continue
-    if value_col is None:
+
+    if not value_cols:
         return None
 
-    # Extract values (up to 20 rows)
+    # Extract data (up to 20 rows)
     try:
         sample_rows = rows[:20]
-        values = [float(r[value_col]) for r in sample_rows if r[value_col] is not None]
-        labels = [str(r[label_col]) for r in sample_rows[:len(values)]]
+        labels = [str(r[label_col]) for r in sample_rows]
+        series = []
+        for col in value_cols:
+            values = [float(r[col]) if r[col] is not None else 0.0 for r in sample_rows]
+            series.append({"name": col, "values": values})
     except (TypeError, ValueError):
         return None
 
-    if len(values) < 2:
+    if len(series[0]["values"]) < 2:
         return None
 
     time_keywords = ("year", "date", "month", "quarter", "period", "week")
@@ -396,9 +399,8 @@ def _detect_chart(rows: list[dict], row_count: int) -> Optional[dict]:
 
     return {
         "type": chart_type,
-        "label": value_col,
         "labels": labels,
-        "values": values,
+        "series": series,
     }
 
 
