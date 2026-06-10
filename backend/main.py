@@ -312,8 +312,14 @@ app.add_middleware(
 )
 
 
+class HistoryMessage(BaseModel):
+    question: str
+    answer: str
+
+
 class ChatRequest(BaseModel):
     question: str
+    history: list[HistoryMessage] = []
 
 
 class ChatResponse(BaseModel):
@@ -520,14 +526,34 @@ def _compute_summary() -> list[dict]:
 
 
 # ── Core functions ────────────────────────────────────────────────────────────
-def generate_sql(question: str, error_context: str = "") -> str:
-    user_content = question
+def _format_history(history: list) -> str:
+    """Format last N Q&A turns into a compact context block for the prompt."""
+    if not history:
+        return ""
+    lines = ["Recent conversation context (use this to resolve follow-up references):"]
+    for i, h in enumerate(history[-3:], 1):  # last 3 turns max
+        lines.append(f"Turn {i}:")
+        lines.append(f"  Q: {h.question}")
+        # Truncate long answers to save tokens
+        answer_preview = h.answer[:300] + "…" if len(h.answer) > 300 else h.answer
+        lines.append(f"  A: {answer_preview}")
+    return "\n".join(lines)
+
+
+def generate_sql(question: str, history: list = [], error_context: str = "") -> str:
+    history_block = _format_history(history)
     if error_context:
         user_content = (
+            f"{history_block}\n\n" if history_block else ""
+        ) + (
             f"Question: {question}\n\n"
             f"The previous SQL query failed with this error:\n{error_context}\n\n"
             "Please generate a corrected SQL query that avoids this error."
         )
+    else:
+        user_content = (
+            f"{history_block}\n\n" if history_block else ""
+        ) + f"Question: {question}"
     raw = call_groq(SQL_SYSTEM_PROMPT, user_content)
     raw = re.sub(r"^```(?:sql)?\s*\n?", "", raw, flags=re.IGNORECASE)
     raw = re.sub(r"\s*```$", "", raw)
@@ -574,23 +600,22 @@ def _rows_to_csv(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def generate_answer(question: str, rows: list[dict], row_count: int) -> str:
+def generate_answer(question: str, rows: list[dict], row_count: int, history: list = []) -> str:
     if not rows:
         results_text = "The query returned no results."
     elif row_count == 1:
-        # Aggregate result — pass everything
         results_text = _rows_to_csv(rows)
     else:
-        # Multi-row — top 10 is enough for the LLM to generate an insight
         sample = rows[:10]
         results_text = _rows_to_csv(sample)
         if row_count > 10:
             results_text += f"\n... ({row_count} total rows, showing top 10)"
+    history_block = _format_history(history)
+    user_content = (
+        f"{history_block}\n\n" if history_block else ""
+    ) + f"Question: {question}\n\nResults ({row_count} row(s)):\n{results_text}"
     log.info(f"[answer] passing {min(row_count,10)}/{row_count} rows to LLM")
-    return call_groq(
-        ANSWER_SYSTEM_PROMPT,
-        f"Question: {question}\n\nResults ({row_count} row(s)):\n{results_text}"
-    )
+    return call_groq(ANSWER_SYSTEM_PROMPT, user_content)
 
 
 # ── /chat endpoint ────────────────────────────────────────────────────────────
@@ -615,10 +640,12 @@ async def chat(request: ChatRequest):
     error_context = ""
     last_sql = None
 
+    history = request.history or []
+
     for attempt in range(1, MAX_RETRIES + 1):
-        log.info(f"[attempt {attempt}/{MAX_RETRIES}] Generating SQL for: {question!r}")
+        log.info(f"[attempt {attempt}/{MAX_RETRIES}] Generating SQL for: {question!r} (history={len(history)} turns)")
         try:
-            sql = generate_sql(question, error_context)
+            sql = generate_sql(question, history, error_context)
             last_sql = sql
         except HTTPException:
             raise  # propagate 429 / 503 directly — don't wrap in 502
@@ -640,7 +667,7 @@ async def chat(request: ChatRequest):
             log.warning(f"Attempt {attempt}: execute failed — {exc}")
             continue
 
-        answer = generate_answer(question, rows, row_count)
+        answer = generate_answer(question, rows, row_count, history)
         chart_data = _detect_chart(rows, row_count)
         latency_ms = int((time.monotonic() - t_start) * 1000)
         log.info(f"Answer: {answer[:120]}... ({latency_ms}ms)")

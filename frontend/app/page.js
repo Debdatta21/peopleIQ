@@ -278,6 +278,12 @@ export default function Home() {
     const q = question.trim();
     if (!q || loading) return;
 
+    // Build history from last 3 completed messages
+    const history = messages
+      .filter(m => m.status === 'done')
+      .slice(-3)
+      .map(m => ({ question: m.question, answer: m.answer }));
+
     // Push a pending message immediately so the user sees their question
     const id = Date.now();
     setMessages(prev => [...prev, { id, question: q, status: 'pending' }]);
@@ -288,7 +294,7 @@ export default function Home() {
       const res = await fetch(`${API_URL}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: q }),
+        body: JSON.stringify({ question: q, history }),
       });
 
       if (!res.ok) {
