@@ -6,13 +6,43 @@ import * as d3 from 'd3';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 const EXAMPLE_QUESTIONS = [
-  'What is our current total headcount?',
-  'What is our attrition rate this quarter?',
-  'Which locations have the highest turnover?',
+  'What is our current headcount?',
+  'What is our rolling 12-month turnover rate?',
+  'Which properties have the most open requisitions?',
+  'What are the top reasons employees are leaving?',
   'How long does it take us to fill a role on average?',
-  'Which departments grew the most this year?',
-  'How many people left within their first 90 days?',
+  'What percentage of new hires are still with us after 12 months?',
 ];
+
+// ── Data Table component ──────────────────────────────────────────────────────
+function DataTable({ rows }) {
+  if (!rows || rows.length === 0) return null;
+  const cols = Object.keys(rows[0]);
+  return (
+    <div style={styles.tableWrapper}>
+      <table style={styles.dataTable}>
+        <thead>
+          <tr>
+            {cols.map(c => (
+              <th key={c} style={styles.dataTh}>{c}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, i) => (
+            <tr key={i} style={{ background: i % 2 === 0 ? '#fff' : '#f9fafb' }}>
+              {cols.map(c => (
+                <td key={c} style={styles.dataTd}>
+                  {row[c] === null || row[c] === undefined ? '—' : String(row[c])}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 // ── D3 Chart component ────────────────────────────────────────────────────────
 const CHART_COLORS = ['#0D7377', '#f59e0b', '#6366f1', '#ef4444', '#10b981'];
@@ -189,7 +219,12 @@ function MessageBubble({ msg }) {
           {msg.status === 'error' && (
             <div style={styles.errorInline}>
               <span style={{ color: '#dc2626', marginRight: 6 }}>⚠</span>
-              {msg.error}
+              <span>{msg.error}</span>
+              {msg.retryable && msg.onRetry && (
+                <button onClick={msg.onRetry} style={styles.retryBtn} type="button">
+                  Try again
+                </button>
+              )}
             </div>
           )}
 
@@ -209,8 +244,14 @@ function MessageBubble({ msg }) {
                 );
               })()}
 
-              {/* Chart */}
-              {msg.chartData && <D3Chart data={msg.chartData} />}
+              {/* Visualisation — chart, table, or KPI based on output_type */}
+              {msg.outputType === 'table' && msg.rows && (
+                <div style={{ marginTop: 14, borderTop: '1px solid #f3f4f6', paddingTop: 14 }}>
+                  <DataTable rows={msg.rows} />
+                </div>
+              )}
+              {msg.outputType === 'chart' && msg.chartData && <D3Chart data={msg.chartData} />}
+              {msg.outputType === 'kpi' && msg.rowCount > 0 && null /* answer text is sufficient */}
 
               {/* Meta row */}
               <div style={styles.metaRow}>
@@ -255,8 +296,10 @@ export default function Home() {
   const inputRef                            = useRef(null);
   const threadEndRef                        = useRef(null);
 
-  // Load workforce brief on mount
+  // Wake backend + load workforce brief on mount
   useEffect(() => {
+    // Ping /health first to wake Render if it's sleeping, then fetch summary
+    fetch(`${API_URL}/health`).catch(() => {});
     fetch(`${API_URL}/summary`)
       .then(r => r.json())
       .then(d => { setSummary(d.metrics); setSummaryLoading(false); })
@@ -273,21 +316,20 @@ export default function Home() {
     inputRef.current?.focus();
   };
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    const q = question.trim();
+  const submitQuestion = useCallback(async (q, retryId = null) => {
     if (!q || loading) return;
 
-    // Build history from last 3 completed messages
     const history = messages
       .filter(m => m.status === 'done')
       .slice(-3)
       .map(m => ({ question: m.question, answer: m.answer }));
 
-    // Push a pending message immediately so the user sees their question
-    const id = Date.now();
-    setMessages(prev => [...prev, { id, question: q, status: 'pending' }]);
-    setQuestion('');
+    const id = retryId || Date.now();
+    if (!retryId) {
+      setMessages(prev => [...prev, { id, question: q, status: 'pending' }]);
+    } else {
+      setMessages(prev => prev.map(m => m.id === id ? { ...m, status: 'pending', error: null } : m));
+    }
     setLoading(true);
 
     try {
@@ -299,11 +341,15 @@ export default function Home() {
 
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
-        const errMsg = res.status === 429
-          ? '⏳ Groq is rate-limited right now. Wait 30–60 seconds and try again.'
-          : (detail?.detail || `Server error ${res.status}`);
+        const is429 = res.status === 429;
+        const errMsg = is429
+          ? 'Groq is rate-limited right now. Wait 30–60 seconds, then tap "Try again".'
+          : (detail?.detail || `Something went wrong (error ${res.status}). Try rephrasing the question.`);
         setMessages(prev => prev.map(m =>
-          m.id === id ? { ...m, status: 'error', error: errMsg } : m
+          m.id === id ? {
+            ...m, status: 'error', error: errMsg, retryable: is429,
+            onRetry: is429 ? () => submitQuestion(q, id) : null,
+          } : m
         ));
         return;
       }
@@ -317,16 +363,27 @@ export default function Home() {
           sql: data.sql,
           rowCount: data.row_count,
           chartData: data.chart_data || null,
+          outputType: data.output_type || 'chart',
+          rows: data.rows || null,
         } : m
       ));
     } catch (err) {
-      const errMsg = err.message || 'Something went wrong. Is the backend running?';
+      const errMsg = 'Could not reach the backend. Make sure it\'s running and try again.';
       setMessages(prev => prev.map(m =>
-        m.id === id ? { ...m, status: 'error', error: errMsg } : m
+        m.id === id ? { ...m, status: 'error', error: errMsg, retryable: true,
+          onRetry: () => submitQuestion(q, id) } : m
       ));
     } finally {
       setLoading(false);
     }
+  }, [messages, loading]);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    const q = question.trim();
+    if (!q || loading) return;
+    setQuestion('');
+    await submitQuestion(q);
   };
 
   return (
@@ -339,7 +396,7 @@ export default function Home() {
         </div>
         <div style={styles.headerRight}>
           <a href="/admin" style={styles.adminLink}>Admin ↗</a>
-          <span style={styles.badge}>Phase 2 Demo</span>
+          <span style={styles.badge}>PoC</span>
         </div>
       </header>
 
@@ -358,7 +415,7 @@ export default function Home() {
         <section style={styles.hero}>
           <h1 style={styles.h1}>Ask anything about your workforce.</h1>
           <p style={styles.subheadline}>
-            Natural language people analytics — powered by 500 synthetic employees across 7 years of generated HR data.
+            Type a plain-English question. Get instant answers from your HR data — headcount, attrition, open roles, exit interviews, and more.
           </p>
         </section>
       )}
@@ -587,7 +644,49 @@ const styles = {
   },
 
   /* Error */
-  errorInline: { fontSize: 14, color: '#7f1d1d', lineHeight: 1.5 },
+  errorInline: {
+    fontSize: 14, color: '#7f1d1d', lineHeight: 1.5,
+    display: 'flex', alignItems: 'flex-start', gap: 6, flexWrap: 'wrap',
+  },
+  retryBtn: {
+    fontSize: 12, color: TEAL, background: '#e6f4f5',
+    border: '1px solid #b3dfe1', borderRadius: 6,
+    padding: '3px 10px', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500,
+    marginLeft: 4,
+  },
+
+  /* Data table */
+  tableWrapper: {
+    overflowX: 'auto',
+    border: '1px solid #e5e7eb',
+    borderRadius: 8,
+    maxHeight: 380,
+    overflowY: 'auto',
+  },
+  dataTable: {
+    width: '100%',
+    borderCollapse: 'collapse',
+    fontSize: 13,
+    background: '#fff',
+  },
+  dataTh: {
+    padding: '8px 14px',
+    textAlign: 'left',
+    fontSize: 11,
+    fontWeight: 600,
+    color: '#6b7280',
+    letterSpacing: '0.05em',
+    textTransform: 'uppercase',
+    background: '#f9fafb',
+    borderBottom: '1px solid #e5e7eb',
+    whiteSpace: 'nowrap',
+  },
+  dataTd: {
+    padding: '8px 14px',
+    color: '#374151',
+    borderBottom: '1px solid #f3f4f6',
+    whiteSpace: 'nowrap',
+  },
 
   /* Answer content */
   answerText: { fontSize: 16, color: '#111827', lineHeight: 1.7, fontWeight: 400, margin: 0 },

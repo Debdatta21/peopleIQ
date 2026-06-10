@@ -83,166 +83,241 @@ def _log_query(question: str, sql: Optional[str], row_count: int,
     except Exception as exc:
         log.warning(f"Failed to write query_log: {exc}")
 
-# ── Schema extraction ─────────────────────────────────────────────────────────
-# Compact schema — table(columns) only. Saves ~1000 tokens vs full DDL.
-SCHEMA_DDL = """
-dim_company(company_id, company_name, company_code)
-dim_date(date_id, full_date, year, quarter, month, month_name, day_of_week, is_weekend, fiscal_year)
-dim_org_unit(org_unit_id, org_unit_name, parent_org_unit_id, org_level, company_id)
-dim_person(person_id, status, hire_date, termination_date, termination_type, employment_type, company_id)
-dim_position(position_id, position_title, job_family, job_level, company_id)
-dim_work_location(location_id, location_name, city, state, region, location_type, company_id)
-fact_compensation(compensation_id, person_id, position_id, company_id, date_id, effective_date, base_amount, compensation_type, change_reason, change_pct, is_current)
-fact_employment_event(event_id, person_id, date_id, event_type, termination_type, tenure_days_at_event, position_id, org_unit_id, location_id, company_id)
-fact_exit_interview(exit_id, person_id, position_id, org_unit_id, location_id, company_id, date_id, exit_date, tenure_days, reason_name, manager_rating_avg, voluntary_flag)
-fact_headcount_snapshot(snapshot_id, person_id, date_id, position_id, org_unit_id, location_id, company_id, is_active, employment_type, tenure_days, tenure_months, tenure_band)
-fact_position_assignment(assignment_id, person_id, position_id, org_unit_id, location_id, company_id, effective_start, effective_end, is_current, promotion_flag)
-fact_recruiting_pipeline(pipeline_id, req_id, candidate_id, stage_name, stage_date, date_id, conversion_flag, company_id)
-fact_requisition(req_id, position_id, org_unit_id, location_id, company_id, status, published_date, fill_date, days_to_fill, hires_count)
-"""
+# ── Guard rails: topic classifier + per-topic schema injection ────────────────
 
-SQL_SYSTEM_PROMPT = f"""You are the Text-to-SQL engine for PeopleIQ, a workforce intelligence platform.
+_GLOBAL_RULES = """You are the Text-to-SQL engine for PeopleIQ, a hospitality workforce intelligence platform.
 Output ONE valid SQLite SELECT query. No markdown, no explanation.
 
-Schema:
-{SCHEMA_DDL}
-
-Rules:
+RULES:
 - SELECT only. No INSERT/UPDATE/DELETE/DROP/CREATE/ALTER/TRUNCATE/PRAGMA.
-- Never use columns: full_name, email (PII).
-- Always alias columns clearly (AS "Headcount", AS "Attrition Rate %").
-- LIMIT 100 unless user asks for fewer.
-- Dates: spine is 2019-01-01 to 2026-06-04. "this year"=2026, "last year"=2025, "this quarter"=Q2 2026, "last quarter"=Q1 2026.
-
-Table routing — use the correct table or the answer will be wrong:
-- headcount / workforce size / how many employees → fact_headcount_snapshot
-- attrition / turnover / terminations / who left → fact_employment_event
-- time to fill / open roles / recruiting → fact_requisition or fact_recruiting_pipeline
-- promotions / role changes / position history → fact_position_assignment (use promotion_flag=1 for promotions)
-- compensation / salary / pay / raises / comp by level → fact_compensation
-- exit reasons / why people left → fact_exit_interview
-
-Patterns:
-
-1. Current headcount:
-SELECT COUNT(*) AS "Current Headcount" FROM fact_headcount_snapshot
-WHERE is_active=1 AND date_id=(SELECT MAX(date_id) FROM fact_headcount_snapshot WHERE is_active=1)
-
-2. Attrition rate for a period:
-SELECT ROUND(COUNT(DISTINCT e.person_id)*100.0/
-  (SELECT COUNT(DISTINCT person_id) FROM fact_headcount_snapshot
-   WHERE is_active=1 AND date_id IN (SELECT date_id FROM dim_date WHERE year=2026 AND quarter=2)),1
-) AS "Attrition Rate %"
-FROM fact_employment_event e JOIN dim_date d ON e.date_id=d.date_id
-WHERE e.event_type='Termination' AND d.year=2026 AND d.quarter=2
-
-3. Time to fill: SELECT ROUND(AVG(days_to_fill),1) AS "Avg Days to Fill" FROM fact_requisition WHERE status='Filled'
-
-4. Turnover by location (default year=2026):
-SELECT l.location_name AS "Location",
-  ROUND(COUNT(DISTINCT e.person_id)*100.0/
-    (SELECT COUNT(DISTINCT person_id) FROM fact_headcount_snapshot h
-     JOIN dim_date d2 ON h.date_id=d2.date_id
-     WHERE h.is_active=1 AND d2.year=2026 AND h.location_id=l.location_id),1) AS "Turnover Rate %"
-FROM fact_employment_event e
-JOIN dim_work_location l ON e.location_id=l.location_id
-JOIN dim_date d ON e.date_id=d.date_id
-WHERE e.event_type='Termination' AND d.year=2026
-GROUP BY l.location_name, l.location_id ORDER BY "Turnover Rate %" DESC
-
-5. Compensation BY job level — always GROUP BY job_level (use for "salary by level", "pay by level", "average salary per level", "pay range by level"):
-SELECT p.job_level AS "Job Level",
-  COUNT(DISTINCT fc.person_id) AS "Employees",
-  ROUND(AVG(fc.base_amount),0) AS "Avg Salary",
-  MIN(fc.base_amount) AS "Min Salary",
-  MAX(fc.base_amount) AS "Max Salary",
-  ROUND(AVG(CASE WHEN pr BETWEEN 0.45 AND 0.55 THEN fc.base_amount END),0) AS "Median Salary"
-FROM (SELECT fc.*, p2.job_level,
-        PERCENT_RANK() OVER (PARTITION BY p2.job_level ORDER BY fc.base_amount) AS pr
-      FROM fact_compensation fc JOIN dim_position p2 ON fc.position_id=p2.position_id
-      WHERE fc.is_current=1 AND fc.compensation_type='Salary') fc
-JOIN dim_position p ON fc.position_id=p.position_id
-GROUP BY p.job_level ORDER BY AVG(fc.base_amount) DESC
-
-5b. Pay RANGE / spread between highest and lowest job levels:
-SELECT
-  MAX(avg_sal) - MIN(avg_sal) AS "Pay Spread ($)",
-  MAX(job_level) AS "Highest Level",  -- alphabetically last; use MAX(avg_sal) logic below
-  MIN(job_level) AS "Lowest Level"
-FROM (
-  SELECT p.job_level, ROUND(AVG(fc.base_amount),0) AS avg_sal
-  FROM fact_compensation fc JOIN dim_position p ON fc.position_id=p.position_id
-  WHERE fc.is_current=1 AND fc.compensation_type='Salary'
-  GROUP BY p.job_level
-)
--- BETTER: show full table from Pattern 5 and let the answer layer describe the spread.
-
-6. Employees with NO salary increase in the past N years — compute cutoff as today minus N years:
--- "past 2 years" → cutoff = DATE('2026-06-04','-2 years') = '2024-06-04'
--- "past 1 year"  → cutoff = DATE('2026-06-04','-1 year')  = '2025-06-04'
-SELECT COUNT(DISTINCT p.person_id) AS "Employees With No Raise"
-FROM dim_person p
-WHERE p.status='Active'
-AND p.person_id NOT IN (
-  SELECT DISTINCT fc.person_id FROM fact_compensation fc
-  WHERE fc.effective_date >= DATE('2026-06-04','-2 years')
-  AND fc.change_reason IN ('Annual Review','Merit Increase','Market Adjustment','Promotion')
-)
-
-7. Average merit increase by reason:
-SELECT change_reason AS "Reason", ROUND(AVG(change_pct),1) AS "Avg % Increase", COUNT(*) AS "Events"
-FROM fact_compensation WHERE change_reason != 'Hire'
-GROUP BY change_reason ORDER BY "Avg % Increase" DESC
-
-8. Promotions with pay increase (cross-table) — join on YEAR only (not month), compensation review date and assignment start date are in the same year but not same month:
-SELECT pa.person_id AS "Person ID",
-  pos_old.job_level AS "Previous Level", pos_new.job_level AS "New Level",
-  ROUND(fc.change_pct,1) AS "Pay Increase %",
-  pa.effective_start AS "Promotion Date"
-FROM fact_position_assignment pa
-JOIN dim_position pos_new ON pa.position_id=pos_new.position_id
-JOIN fact_compensation fc ON pa.person_id=fc.person_id AND fc.change_reason='Promotion'
-  AND SUBSTR(fc.effective_date,1,4)=SUBSTR(pa.effective_start,1,4)
-JOIN dim_position pos_old ON pos_old.position_id=(
-  SELECT position_id FROM fact_position_assignment
-  WHERE person_id=pa.person_id AND effective_start < pa.effective_start
-  ORDER BY effective_start DESC LIMIT 1)
-WHERE pa.promotion_flag=1
-ORDER BY pa.effective_start DESC
-
-9. Promotion rate: SELECT ROUND(COUNT(DISTINCT person_id)*100.0/(SELECT COUNT(*) FROM dim_person WHERE status='Active'),1) AS "Promotion Rate %" FROM fact_position_assignment WHERE promotion_flag=1
-
-10. Contractor vs full-time pay comparison — always show compensation_type separately with units note; NEVER compare Contract Rate (hourly $/hr) directly to Salary (annual $) as a ratio:
-SELECT compensation_type AS "Comp Type",
-  COUNT(DISTINCT person_id) AS "Employees",
-  ROUND(AVG(base_amount),0) AS "Avg Pay",
-  MIN(base_amount) AS "Min", MAX(base_amount) AS "Max"
-FROM fact_compensation WHERE is_current=1
-GROUP BY compensation_type ORDER BY AVG(base_amount) DESC
-
-Rules for compensation:
-- is_current=1 → current state questions ("what is comp today")
-- Filter by effective_date year → historical questions ("what were salaries in 2025")
-- compensation_type: 'Salary' (annual $, W2 Salaried), 'Hourly' ($/hr, W2 Hourly), 'Contract Rate' ($/hr, Contingent/Agency)
-- Salary is annual dollars. Hourly and Contract Rate are dollars per hour. Never compare them as if same units.
-- change_reason values: 'Hire','Annual Review','Merit Increase','Market Adjustment','Promotion'
-- Never mix is_current=1 with a year filter
-- "past N years/months" → use DATE('2026-06-04','-N years') for the cutoff, not a hardcoded January date
+- Never return PII: full_name, email, forwarding_address, or any free-text narrative field.
+- Always alias columns clearly (AS "Headcount", AS "Turnover %", AS "Property").
+- LIMIT 100 unless the question requests fewer.
+- Dates spine: 2019-01-01 to 2026-06-09. "this year"=2026, "last year"=2025, "this quarter"=Q2 2026.
+- xw_location_active is THE location spine — always JOIN through it to get location_name or property_type.
+- For separations: use dim_employee[termination_date] or fact_employee_event — NEVER fact_requisition_fill.
+- Exit reasons: ALWAYS exclude reason_name='Other' — removed from all visuals by business rule.
 """
+
+_TOPIC_CONTEXT = {
+    "headcount": {
+        "schema": """
+xw_location_active(location_code PK, location_name, city, state, region, property_type[Property|Corporate], is_active)
+dim_employee(employee_id, is_active_current[1|0], hire_date, termination_date, termination_type[Voluntary|Involuntary], standard_position, employment_type[Full-Time|Part-Time|Seasonal|Temporary], job_type[Property|Corporate], location_code)
+fact_employee_snapshot_monthly(snapshot_id, employee_id, snapshot_date[month-end], is_active, tenure_months_asof_month_end, location_code, standard_position, employment_type)
+""",
+        "patterns": """
+-- Live headcount:
+SELECT COUNT(*) AS "Current Headcount" FROM dim_employee WHERE is_active_current=1
+
+-- Property vs Corporate split:
+SELECT job_type AS "Type", COUNT(*) AS "Headcount"
+FROM dim_employee WHERE is_active_current=1 GROUP BY job_type ORDER BY "Headcount" DESC
+
+-- Period-end (latest monthly snapshot):
+SELECT COUNT(*) AS "Period-End Headcount" FROM fact_employee_snapshot_monthly
+WHERE snapshot_date=(SELECT MAX(snapshot_date) FROM fact_employee_snapshot_monthly WHERE is_active=1) AND is_active=1
+
+-- Headcount by region (always join location spine):
+SELECT x.region AS "Region", x.property_type AS "Type", COUNT(*) AS "Headcount"
+FROM dim_employee d JOIN xw_location_active x ON d.location_code=x.location_code
+WHERE d.is_active_current=1 GROUP BY x.region, x.property_type ORDER BY "Headcount" DESC
+
+-- Avg tenure active vs separated:
+SELECT 'Active' AS "Status", ROUND(AVG(JULIANDAY('2026-06-09')-JULIANDAY(hire_date))/30.44,1) AS "Avg Tenure (Months)"
+FROM dim_employee WHERE is_active_current=1
+UNION ALL
+SELECT 'Separated (last 12M)', ROUND(AVG(JULIANDAY(termination_date)-JULIANDAY(hire_date))/30.44,1)
+FROM dim_employee WHERE is_active_current=0 AND termination_date >= DATE('2026-06-09','-12 months')
+"""
+    },
+    "separations": {
+        "schema": """
+xw_location_active(location_code PK, location_name, city, state, region, property_type[Property|Corporate], is_active)
+dim_employee(employee_id, is_active_current[1|0], hire_date, termination_date, termination_type[Voluntary|Involuntary], standard_position, employment_type, job_type[Property|Corporate], location_code)
+fact_employee_event(event_id, employee_id, event_date, event_type[Hire|Termination], termination_type[Voluntary|Involuntary], tenure_days_at_event, location_code, standard_position)
+fact_employee_snapshot_monthly(snapshot_id, employee_id, snapshot_date, is_active, tenure_months_asof_month_end, location_code)
+""",
+        "patterns": """
+-- Rolling 12-month turnover rate:
+SELECT ROUND(COUNT(DISTINCT e.employee_id)*100.0/
+  (SELECT COUNT(DISTINCT s.employee_id) FROM fact_employee_snapshot_monthly s
+   WHERE s.snapshot_date >= DATE('2026-06-09','-12 months') AND s.is_active=1),1) AS "Rolling 12M Turnover %"
+FROM fact_employee_event e
+WHERE e.event_type='Termination' AND e.event_date >= DATE('2026-06-09','-12 months')
+
+-- Voluntary vs involuntary:
+SELECT termination_type AS "Type", COUNT(*) AS "Count",
+  ROUND(COUNT(*)*100.0/(SELECT COUNT(*) FROM fact_employee_event WHERE event_type='Termination'),1) AS "% of Total"
+FROM fact_employee_event WHERE event_type='Termination' GROUP BY termination_type
+
+-- Separations by standard position:
+SELECT standard_position AS "Position", COUNT(*) AS "Separations"
+FROM fact_employee_event WHERE event_type='Termination'
+GROUP BY standard_position ORDER BY "Separations" DESC LIMIT 15
+
+-- Separations by property (table result — many rows expected):
+SELECT x.location_name AS "Property", x.state AS "State", COUNT(*) AS "Separations"
+FROM fact_employee_event e JOIN xw_location_active x ON e.location_code=x.location_code
+WHERE e.event_type='Termination' AND e.event_date >= DATE('2026-06-09','-12 months')
+GROUP BY x.location_name, x.state ORDER BY "Separations" DESC
+"""
+    },
+    "recruiting": {
+        "schema": """
+xw_location_active(location_code PK, location_name, city, state, region, property_type[Property|Corporate], is_active)
+dim_requisition(req_id, status[Published|Filled|Draft|Cancelled], publish_date, fill_date, days_to_fill, opp_work_location_code, standard_position)
+fact_requisition_fill(fill_id, req_id, days_publish_to_first_hire, hire_date, location_code)
+""",
+        "patterns": """
+-- Open reqs count by status:
+SELECT status AS "Status", COUNT(*) AS "Count" FROM dim_requisition GROUP BY status ORDER BY "Count" DESC
+
+-- Open published reqs by property (table result):
+SELECT x.location_name AS "Property", x.state AS "State", x.region AS "Region", COUNT(*) AS "Open Reqs"
+FROM dim_requisition r JOIN xw_location_active x ON r.opp_work_location_code=x.location_code
+WHERE r.status='Published' GROUP BY x.location_name, x.state, x.region ORDER BY "Open Reqs" DESC LIMIT 50
+
+-- Avg days to fill with colour buckets:
+SELECT ROUND(AVG(days_publish_to_first_hire),1) AS "Avg Days to Fill",
+  SUM(CASE WHEN days_publish_to_first_hire<=30 THEN 1 ELSE 0 END) AS "On Target (0-30d)",
+  SUM(CASE WHEN days_publish_to_first_hire BETWEEN 31 AND 60 THEN 1 ELSE 0 END) AS "Watch (31-60d)",
+  SUM(CASE WHEN days_publish_to_first_hire>60 THEN 1 ELSE 0 END) AS "Critical (60+d)"
+FROM fact_requisition_fill
+
+-- Req aging buckets:
+SELECT
+  SUM(CASE WHEN JULIANDAY('2026-06-09')-JULIANDAY(publish_date)<=30 THEN 1 ELSE 0 END) AS "0-30 Days",
+  SUM(CASE WHEN JULIANDAY('2026-06-09')-JULIANDAY(publish_date) BETWEEN 31 AND 60 THEN 1 ELSE 0 END) AS "31-60 Days",
+  SUM(CASE WHEN JULIANDAY('2026-06-09')-JULIANDAY(publish_date)>60 THEN 1 ELSE 0 END) AS "60+ Days"
+FROM dim_requisition WHERE status='Published'
+"""
+    },
+    "exit_interviews": {
+        "schema": """
+dim_exit_reason(reason_id, reason_name)
+fact_exit_interview(exit_id, employee_id, exit_date, job_type[Property|Corporate|Unknown], tenure_days, tenure_years, would_recommend[Recommend|Neutral|Would Not Recommend], mgr_dimension_1[1-3], mgr_dimension_2[1-3], mgr_dimension_3[1-3], mgr_dimension_4[1-3], location_code)
+bridge_exit_reason(bridge_id, exit_id, reason_id)
+xw_exit_interview_property(location_code PK, property_name, property_type)
+""",
+        "patterns": """
+-- Top exit reasons (ALWAYS exclude Other):
+SELECT r.reason_name AS "Reason", COUNT(*) AS "Count",
+  ROUND(COUNT(*)*100.0/(SELECT COUNT(*) FROM bridge_exit_reason),1) AS "% of Tags"
+FROM bridge_exit_reason b JOIN dim_exit_reason r ON b.reason_id=r.reason_id
+WHERE r.reason_name != 'Other' GROUP BY r.reason_name ORDER BY "Count" DESC
+
+-- Would recommend breakdown:
+SELECT would_recommend AS "Response", COUNT(*) AS "Count",
+  ROUND(COUNT(*)*100.0/(SELECT COUNT(*) FROM fact_exit_interview),1) AS "%"
+FROM fact_exit_interview GROUP BY would_recommend ORDER BY "Count" DESC
+
+-- Manager rating % positive (scale 1=neg, 2=neutral, 3=pos):
+SELECT ROUND(AVG((CAST(mgr_dimension_1-1 AS REAL)+CAST(mgr_dimension_2-1 AS REAL)+
+  CAST(mgr_dimension_3-1 AS REAL)+CAST(mgr_dimension_4-1 AS REAL))/8.0)*100,1) AS "Mgr Rating % Positive",
+  COUNT(*) AS "Responses"
+FROM fact_exit_interview
+
+-- Exit responses by job type:
+SELECT job_type AS "Job Type", COUNT(*) AS "Responses",
+  ROUND(AVG(tenure_years),1) AS "Avg Tenure (Years)"
+FROM fact_exit_interview GROUP BY job_type ORDER BY "Responses" DESC
+"""
+    },
+    "retention": {
+        "schema": """
+dim_employee(employee_id, is_active_current[1|0], hire_date, termination_date, standard_position, employment_type, job_type[Property|Corporate], location_code)
+fact_employee_snapshot_monthly(snapshot_id, employee_id, snapshot_date[month-end], is_active, tenure_months_asof_month_end, location_code)
+xw_location_active(location_code PK, location_name, city, state, region, property_type, is_active)
+""",
+        "patterns": """
+-- 12-month new hire retention:
+SELECT
+  COUNT(DISTINCT CASE WHEN is_active_current=1 THEN employee_id END) AS "Still Active",
+  COUNT(DISTINCT employee_id) AS "Total in Cohort",
+  ROUND(COUNT(DISTINCT CASE WHEN is_active_current=1 THEN employee_id END)*100.0/COUNT(DISTINCT employee_id),1) AS "12-Month Retention %"
+FROM dim_employee
+WHERE hire_date <= DATE('2026-06-09','-12 months') AND hire_date >= DATE('2026-06-09','-24 months')
+
+-- Retention by job type:
+SELECT job_type AS "Job Type",
+  COUNT(DISTINCT CASE WHEN is_active_current=1 THEN employee_id END) AS "Retained",
+  COUNT(DISTINCT employee_id) AS "Cohort Size",
+  ROUND(COUNT(DISTINCT CASE WHEN is_active_current=1 THEN employee_id END)*100.0/COUNT(DISTINCT employee_id),1) AS "Retention %"
+FROM dim_employee
+WHERE hire_date <= DATE('2026-06-09','-12 months') AND hire_date >= DATE('2026-06-09','-24 months')
+GROUP BY job_type
+
+-- Early attrition (left within 90 days):
+SELECT COUNT(*) AS "Left Within 90 Days",
+  ROUND(COUNT(*)*100.0/(SELECT COUNT(*) FROM dim_employee WHERE hire_date >= DATE('2026-06-09','-12 months')),1) AS "% of New Hires"
+FROM dim_employee
+WHERE hire_date >= DATE('2026-06-09','-12 months')
+AND termination_date IS NOT NULL
+AND JULIANDAY(termination_date)-JULIANDAY(hire_date) <= 90
+"""
+    },
+}
+
+
+def _classify_topic(question: str, history: list = []) -> str:
+    """Keyword classifier — no LLM call, no tokens spent."""
+    ctx = question.lower()
+    for h in (history or [])[-2:]:
+        ctx += " " + h.question.lower()
+
+    if any(w in ctx for w in ["exit interview", "leaving reason", "reason for leaving",
+                               "why.*left", "would recommend", "manager rating",
+                               "mgr rating", "exit survey", "why people leave"]):
+        return "exit_interviews"
+
+    if any(w in ctx for w in ["requisition", " req ", "open role", "open position",
+                               "open job", "days to fill", "time to fill", "fill a role",
+                               "published", "vacancy", "vacancies", "hiring pipeline"]):
+        return "recruiting"
+
+    if any(w in ctx for w in ["retention", "still with us", "still active", "new hire cohort",
+                               "12 month retention", "12-month", "early attrition",
+                               "90 day", "first 90", "onboard"]):
+        return "retention"
+
+    if any(w in ctx for w in ["terminat", "separat", "attrition", "turnover", "who left",
+                               "left the company", "quit", "resign", "involuntary",
+                               "voluntary exit", "separation", "people left", "who has left"]):
+        return "separations"
+
+    return "headcount"
+
+
+def _build_sql_prompt(topic: str) -> str:
+    ctx = _TOPIC_CONTEXT.get(topic, _TOPIC_CONTEXT["headcount"])
+    return (
+        f"{_GLOBAL_RULES}\n"
+        f"Relevant tables for this question:\n{ctx['schema']}\n"
+        f"Verified SQL patterns:\n{ctx['patterns']}"
+    )
+
+
+# Keep SCHEMA_DDL as reference (used by health endpoint)
+SCHEMA_DDL = "\n".join(
+    f"{t}({','.join(set(','.join(v['schema'].split()).split(',')))})"
+    for t, v in _TOPIC_CONTEXT.items()
+)
+
+# SQL_SYSTEM_PROMPT replaced by _build_sql_prompt(topic) — see guard rails above
 
 
 ANSWER_SYSTEM_PROMPT = (
-    "You are PeopleIQ, a friendly workforce analytics assistant. "
+    "You are PeopleIQ, a friendly workforce analytics assistant for a hospitality company. "
     "Turn SQL query results into clear, concise answers for a non-technical HR audience.\n"
     "- Write in complete sentences. Use plain English.\n"
     "- Never use SQL, column names, or technical jargon.\n"
     "- Be specific with numbers. Round percentages to one decimal place.\n"
-    "- Compensation units: 'Salary' values are annual dollars (e.g. $74,000/yr). "
-    "'Hourly' and 'Contract Rate' values are dollars per hour (e.g. $35/hr). "
-    "NEVER compare annual salary to hourly rates as if they are the same unit — always state the unit.\n"
+    "- 'Property' employees work at hotel/property locations. 'Corporate' employees work at regional or HQ offices.\n"
+    "- Manager ratings are on a 1-3 scale: 1=negative, 2=neutral, 3=positive. When reporting % positive, explain the scale briefly.\n"
     "- If results are empty, say so clearly and suggest a related question.\n"
     "- Keep answers under 150 words unless the data genuinely requires more.\n"
-    "- Do not mention employee names under any circumstances.\n"
+    "- Do not mention individual employee names under any circumstances.\n"
     "- End every answer with a new line starting with 'Data sources:' followed by a plain-English "
     "comma-separated list of the data sources used (e.g. 'Data sources: Employee records, Location data, Termination events'). "
     "Use plain business language, not table names."
@@ -327,6 +402,8 @@ class ChatResponse(BaseModel):
     sql: Optional[str] = None
     row_count: int = 0
     chart_data: Optional[dict] = None
+    output_type: str = "chart"          # "chart" | "table" | "kpi"
+    rows: Optional[list] = None         # raw rows for table rendering
 
 
 class SummaryMetric(BaseModel):
@@ -410,113 +487,160 @@ def _detect_chart(rows: list[dict], row_count: int) -> Optional[dict]:
     }
 
 
-# ── Summary (6 canned metrics) ────────────────────────────────────────────────
+# ── Output type router ───────────────────────────────────────────────────────
+def _decide_output_type(rows: list[dict], row_count: int,
+                        question: str, chart_data: Optional[dict]) -> str:
+    """Decide how the frontend should render the result."""
+    if row_count == 0:
+        return "kpi"
+
+    # Single aggregate number → KPI card
+    if row_count == 1 and rows and len(rows[0]) == 1:
+        return "kpi"
+
+    # Location / property breakdowns → always table (30+ rows, bar chart is unreadable)
+    location_words = ("property", "properties", "location", "locations",
+                      "region", "state", "city", "site", "by propert")
+    q_lower = question.lower()
+    if any(w in q_lower for w in location_words) and row_count > 5:
+        return "table"
+
+    # More than 4 columns → table
+    if rows and len(rows[0]) > 4:
+        return "table"
+
+    # More than 20 rows → table
+    if row_count > 20:
+        return "table"
+
+    # No chartable structure → table
+    if chart_data is None and row_count > 1:
+        return "table"
+
+    return "chart"
+
+
+# ── Summary (6 canned metrics — uses new schema) ─────────────────────────────
 def _compute_summary() -> list[dict]:
-    TODAY = "2026-06-04"
+    TODAY = "2026-06-09"
     con = sqlite3.connect(DB_PATH)
     metrics = []
 
     try:
         # 1. Current headcount
         hc = con.execute(
-            "SELECT COUNT(*) FROM fact_headcount_snapshot "
-            "WHERE is_active=1 AND date_id=(SELECT MAX(date_id) FROM fact_headcount_snapshot WHERE is_active=1)"
+            "SELECT COUNT(*) FROM dim_employee WHERE is_active_current=1"
         ).fetchone()[0]
+        prop = con.execute(
+            "SELECT COUNT(*) FROM dim_employee WHERE is_active_current=1 AND job_type='Property'"
+        ).fetchone()[0]
+        corp = hc - prop
         metrics.append(dict(
             key="headcount", metric="Current Headcount",
-            value_fmt=f"{hc:,} employees", status="good",
-            headline=f"Headcount holds steady at {hc:,}",
-            detail="Active workforce stable across all locations.",
-            question="Break down our headcount by department and location",
+            value_fmt=f"{hc:,} employees",
+            status="good",
+            headline=f"Active headcount at {hc:,} employees",
+            detail=f"{prop} property / {corp} corporate across all locations.",
+            question="What is the split between property and corporate employees?",
         ))
 
-        # 2. No raise in 2 years
-        active_total = con.execute("SELECT COUNT(*) FROM dim_person WHERE status='Active'").fetchone()[0]
-        no_raise = con.execute(f"""
-            SELECT COUNT(DISTINCT p.person_id) FROM dim_person p
-            WHERE p.status='Active'
-            AND p.person_id NOT IN (
-              SELECT DISTINCT fc.person_id FROM fact_compensation fc
-              WHERE fc.effective_date >= DATE('{TODAY}','-2 years')
-              AND fc.change_reason IN ('Annual Review','Merit Increase','Market Adjustment','Promotion')
-            )
+        # 2. Rolling 12-month turnover
+        terms_12m = con.execute(f"""
+            SELECT COUNT(DISTINCT employee_id) FROM fact_employee_event
+            WHERE event_type='Termination' AND event_date >= DATE('{TODAY}','-12 months')
         """).fetchone()[0]
-        pct_nr = round(no_raise * 100 / active_total) if active_total else 0
+        avg_hc_12m = con.execute(f"""
+            SELECT COUNT(DISTINCT employee_id) FROM fact_employee_snapshot_monthly
+            WHERE snapshot_date >= DATE('{TODAY}','-12 months') AND is_active=1
+        """).fetchone()[0]
+        turnover = round(terms_12m * 100.0 / avg_hc_12m, 1) if avg_hc_12m else 0
+        vol_12m = con.execute(f"""
+            SELECT COUNT(*) FROM fact_employee_event
+            WHERE event_type='Termination' AND termination_type='Voluntary'
+            AND event_date >= DATE('{TODAY}','-12 months')
+        """).fetchone()[0]
+        vol_pct = round(vol_12m * 100 / terms_12m) if terms_12m else 0
         metrics.append(dict(
-            key="no_raise", metric="No Raise in 2 Years",
-            value_fmt=f"{no_raise} employees ({pct_nr}%)",
-            status="alert" if pct_nr > 50 else "watch" if pct_nr > 25 else "good",
-            headline=f"{pct_nr}% of staff haven't had a raise in 2 years",
-            detail=f"{no_raise} of {active_total} active employees with no salary increase since Jun 2024.",
-            question="Which employees have not had a salary increase in the past 2 years?",
+            key="turnover", metric="Rolling 12M Turnover",
+            value_fmt=f"{turnover}%",
+            status="alert" if turnover > 40 else "watch" if turnover > 25 else "good",
+            headline=f"Rolling 12-month turnover at {turnover}%",
+            detail=f"{terms_12m} separations in past 12 months. {vol_pct}% voluntary.",
+            question="What is our rolling 12-month turnover rate and which properties are highest?",
         ))
 
-        # 3. Attrition YTD
-        terms = con.execute("""
-            SELECT COUNT(DISTINCT e.person_id) FROM fact_employment_event e
-            JOIN dim_date d ON e.date_id=d.date_id
-            WHERE e.event_type='Termination' AND d.year=2026
+        # 3. 12-month new hire retention
+        cohort_total = con.execute(f"""
+            SELECT COUNT(*) FROM dim_employee
+            WHERE hire_date <= DATE('{TODAY}','-12 months')
+            AND hire_date >= DATE('{TODAY}','-24 months')
         """).fetchone()[0]
-        hc_base = con.execute("""
-            SELECT COUNT(DISTINCT h.person_id) FROM fact_headcount_snapshot h
-            JOIN dim_date d ON h.date_id=d.date_id
-            WHERE h.is_active=1 AND d.year=2026
+        cohort_retained = con.execute(f"""
+            SELECT COUNT(*) FROM dim_employee
+            WHERE hire_date <= DATE('{TODAY}','-12 months')
+            AND hire_date >= DATE('{TODAY}','-24 months')
+            AND is_active_current=1
         """).fetchone()[0]
-        attr = round(terms * 100.0 / hc_base, 1) if hc_base else 0
-        vol = con.execute("""
-            SELECT COUNT(*) FROM fact_employment_event e JOIN dim_date d ON e.date_id=d.date_id
-            WHERE e.event_type='Termination' AND d.year=2026 AND e.termination_type='Voluntary'
-        """).fetchone()[0]
-        vol_pct = round(vol * 100 / terms) if terms else 0
+        retention = round(cohort_retained * 100.0 / cohort_total, 1) if cohort_total else 0
         metrics.append(dict(
-            key="attrition", metric="Attrition Rate YTD",
-            value_fmt=f"{attr}%",
-            status="alert" if attr > 15 else "watch" if attr > 10 else "good",
-            headline=f"Attrition running at {attr}% year-to-date",
-            detail=f"Above 10% baseline. {vol_pct}% of exits are voluntary.",
-            question="What is our attrition rate this year and which departments are most affected?",
+            key="retention", metric="12-Month Retention",
+            value_fmt=f"{retention}%",
+            status="good" if retention >= 70 else "watch" if retention >= 55 else "alert",
+            headline=f"{retention}% of hires from 12–24 months ago are still active",
+            detail=f"{cohort_retained} of {cohort_total} employees in that cohort retained.",
+            question="What percentage of employees hired 12 months ago are still with us?",
         ))
 
-        # 4. Time to fill
+        # 4. Open requisitions
+        open_reqs = con.execute(
+            "SELECT COUNT(*) FROM dim_requisition WHERE status='Published'"
+        ).fetchone()[0]
         ttf = con.execute(
-            "SELECT ROUND(AVG(days_to_fill),1) FROM fact_requisition WHERE status='Filled'"
+            "SELECT ROUND(AVG(days_publish_to_first_hire),1) FROM fact_requisition_fill"
         ).fetchone()[0] or 0
         metrics.append(dict(
-            key="time_to_fill", metric="Avg Time to Fill",
-            value_fmt=f"{ttf} days",
-            status="alert" if ttf > 60 else "watch" if ttf > 45 else "good",
-            headline=f"Roles filling in {ttf} days on average",
-            detail="Time-to-fill is within healthy range." if ttf <= 45 else f"{ttf}-day average is above the 45-day target.",
-            question="How long does it take us to fill a role on average?",
+            key="open_reqs", metric="Open Requisitions",
+            value_fmt=f"{open_reqs} open",
+            status="watch" if open_reqs > 50 else "good",
+            headline=f"{open_reqs} positions currently open",
+            detail=f"Average time to fill a role is {ttf} days.",
+            question="Which properties have the most open requisitions right now?",
         ))
 
-        # 5. Promotion rate
-        promoted = con.execute(
-            "SELECT COUNT(DISTINCT person_id) FROM fact_position_assignment WHERE promotion_flag=1"
-        ).fetchone()[0]
-        promo_rate = round(promoted * 100.0 / active_total, 1) if active_total else 0
+        # 5. Top exit reason
+        top_reason = con.execute("""
+            SELECT r.reason_name, COUNT(*) AS cnt
+            FROM bridge_exit_reason b JOIN dim_exit_reason r ON b.reason_id=r.reason_id
+            WHERE r.reason_name != 'Other'
+            GROUP BY r.reason_name ORDER BY cnt DESC LIMIT 1
+        """).fetchone()
+        total_exits = con.execute("SELECT COUNT(*) FROM fact_exit_interview").fetchone()[0]
+        reason_name = top_reason[0] if top_reason else "N/A"
+        reason_cnt  = top_reason[1] if top_reason else 0
+        reason_pct  = round(reason_cnt * 100.0 / total_exits, 1) if total_exits else 0
         metrics.append(dict(
-            key="promotion_rate", metric="Promotion Rate",
-            value_fmt=f"{promo_rate}%",
-            status="alert" if promo_rate < 1 else "watch" if promo_rate < 5 else "good",
-            headline=f"Promotion rate at {promo_rate}% — {'healthy' if promo_rate >= 5 else 'below target'}",
-            detail=f"{promoted} promotions among active employees. Industry median is 5–8%.",
-            question="Who received a promotion and what was their pay increase?",
+            key="exit_reason", metric="Top Exit Reason",
+            value_fmt=reason_name,
+            status="watch",
+            headline=f'"{reason_name}" is the leading reason for leaving',
+            detail=f"Cited in {reason_pct}% of {total_exits} exit interviews.",
+            question="What are the top reasons employees are leaving?",
         ))
 
-        # 6. Avg merit increase last year
-        merit = con.execute("""
-            SELECT ROUND(AVG(change_pct),1) FROM fact_compensation
-            WHERE change_reason IN ('Annual Review','Merit Increase','Market Adjustment')
-            AND effective_date >= '2025-01-01' AND effective_date < '2026-01-01'
+        # 6. Manager rating
+        mgr_positive = con.execute("""
+            SELECT ROUND(AVG(
+              (CAST(mgr_dimension_1-1 AS REAL) + CAST(mgr_dimension_2-1 AS REAL) +
+               CAST(mgr_dimension_3-1 AS REAL) + CAST(mgr_dimension_4-1 AS REAL)) / 8.0
+            ) * 100, 1) FROM fact_exit_interview
         """).fetchone()[0] or 0
         metrics.append(dict(
-            key="merit_increase", metric="Avg Merit Increase (2025)",
-            value_fmt=f"{merit}%",
-            status="alert" if merit < 2 else "watch" if merit < 3 else "good",
-            headline=f"Merit increases averaging {merit}% in 2025",
-            detail="In line with cost-of-living norms." if merit >= 3 else f"{merit}% average is below the 3% cost-of-living baseline.",
-            question="What was the average merit increase percentage last year?",
+            key="mgr_rating", metric="Manager Rating",
+            value_fmt=f"{mgr_positive}% positive",
+            status="good" if mgr_positive >= 65 else "watch" if mgr_positive >= 50 else "alert",
+            headline=f"Manager ratings {mgr_positive}% positive in exit surveys",
+            detail="Based on 4 leadership dimensions rated by departing employees.",
+            question="How are managers rated in exit interviews and which dimensions score lowest?",
         ))
 
     finally:
@@ -540,21 +664,18 @@ def _format_history(history: list) -> str:
     return "\n".join(lines)
 
 
-def generate_sql(question: str, history: list = [], error_context: str = "") -> str:
+def generate_sql(question: str, history: list = [], error_context: str = "", topic: str = "headcount") -> str:
+    system_prompt = _build_sql_prompt(topic)
     history_block = _format_history(history)
     if error_context:
-        user_content = (
-            f"{history_block}\n\n" if history_block else ""
-        ) + (
+        user_content = (f"{history_block}\n\n" if history_block else "") + (
             f"Question: {question}\n\n"
             f"The previous SQL query failed with this error:\n{error_context}\n\n"
             "Please generate a corrected SQL query that avoids this error."
         )
     else:
-        user_content = (
-            f"{history_block}\n\n" if history_block else ""
-        ) + f"Question: {question}"
-    raw = call_groq(SQL_SYSTEM_PROMPT, user_content)
+        user_content = (f"{history_block}\n\n" if history_block else "") + f"Question: {question}"
+    raw = call_groq(system_prompt, user_content)
     raw = re.sub(r"^```(?:sql)?\s*\n?", "", raw, flags=re.IGNORECASE)
     raw = re.sub(r"\s*```$", "", raw)
     return raw.strip()
@@ -641,11 +762,13 @@ async def chat(request: ChatRequest):
     last_sql = None
 
     history = request.history or []
+    topic   = _classify_topic(question, history)
+    log.info(f"[topic] {topic!r} for: {question!r}")
 
     for attempt in range(1, MAX_RETRIES + 1):
-        log.info(f"[attempt {attempt}/{MAX_RETRIES}] Generating SQL for: {question!r} (history={len(history)} turns)")
+        log.info(f"[attempt {attempt}/{MAX_RETRIES}] Generating SQL (topic={topic})")
         try:
-            sql = generate_sql(question, history, error_context)
+            sql = generate_sql(question, history, error_context, topic)
             last_sql = sql
         except HTTPException:
             raise  # propagate 429 / 503 directly — don't wrap in 502
@@ -667,12 +790,18 @@ async def chat(request: ChatRequest):
             log.warning(f"Attempt {attempt}: execute failed — {exc}")
             continue
 
-        answer = generate_answer(question, rows, row_count, history)
-        chart_data = _detect_chart(rows, row_count)
-        latency_ms = int((time.monotonic() - t_start) * 1000)
-        log.info(f"Answer: {answer[:120]}... ({latency_ms}ms)")
+        answer      = generate_answer(question, rows, row_count, history)
+        chart_data  = _detect_chart(rows, row_count)
+        output_type = _decide_output_type(rows, row_count, question, chart_data)
+        latency_ms  = int((time.monotonic() - t_start) * 1000)
+        log.info(f"Answer ({output_type}, {latency_ms}ms): {answer[:80]}...")
         _log_query(question, sql, row_count, True, None, latency_ms, chart_data)
-        return ChatResponse(answer=answer, sql=sql, row_count=row_count, chart_data=chart_data)
+        # Send raw rows to frontend only for table rendering (cap at 100)
+        table_rows = rows[:100] if output_type == "table" else None
+        return ChatResponse(
+            answer=answer, sql=sql, row_count=row_count,
+            chart_data=chart_data, output_type=output_type, rows=table_rows
+        )
 
     latency_ms = int((time.monotonic() - t_start) * 1000)
     log.error(f"All {MAX_RETRIES} attempts failed for: {question!r}")
