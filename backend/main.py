@@ -261,30 +261,52 @@ AND JULIANDAY(termination_date)-JULIANDAY(hire_date) <= 90
 
 
 def _classify_topic(question: str, history: list = []) -> str:
-    """Keyword classifier — no LLM call, no tokens spent."""
-    ctx = question.lower()
-    for h in (history or [])[-2:]:
-        ctx += " " + h.question.lower()
+    """Keyword classifier — no LLM call, no tokens spent.
+    Priority 1: strong signals in the CURRENT question always win.
+    Priority 2: for short ambiguous follow-ups (≤5 words), inherit from last question.
+    """
+    q = question.lower().strip()
 
-    if any(w in ctx for w in ["exit interview", "leaving reason", "reason for leaving",
-                               "why.*left", "would recommend", "manager rating",
-                               "mgr rating", "exit survey", "why people leave"]):
+    # ── Priority 1: current question wins ────────────────────────────────────
+    if any(w in q for w in ["headcount", "how many employ", "workforce size",
+                              "active employ", "property vs corporate", "corporate vs property",
+                              "how many people work", "split between", "total employ",
+                              "staff count", "how many staff"]):
+        return "headcount"
+
+    if any(w in q for w in ["exit interview", "reason", "leaving", "left the company",
+                              "why people", "would recommend", "manager rating",
+                              "mgr rating", "exit survey", "why employees",
+                              "why did", "quit rate"]):
         return "exit_interviews"
 
-    if any(w in ctx for w in ["requisition", " req ", "open role", "open position",
-                               "open job", "days to fill", "time to fill", "fill a role",
-                               "published", "vacancy", "vacancies", "hiring pipeline"]):
+    if any(w in q for w in ["requisition", " req ", "open role", "open position",
+                              "open job", "days to fill", "time to fill", "fill a role",
+                              "vacancy", "vacancies", "hiring pipeline", "time to hire",
+                              "published"]):
         return "recruiting"
 
-    if any(w in ctx for w in ["retention", "still with us", "still active", "new hire cohort",
-                               "12 month retention", "12-month", "early attrition",
-                               "90 day", "first 90", "onboard"]):
+    if any(w in q for w in ["retention", "still with us", "still active",
+                              "12 month retention", "early attrition",
+                              "90 day", "first 90", "stayed", "new hire cohort"]):
         return "retention"
 
-    if any(w in ctx for w in ["terminat", "separat", "attrition", "turnover", "who left",
-                               "left the company", "quit", "resign", "involuntary",
-                               "voluntary exit", "separation", "people left", "who has left"]):
+    if any(w in q for w in ["terminat", "separat", "attrition", "turnover",
+                              "quit", "resign", "involuntary", "voluntary exit",
+                              "who left", "people left"]):
         return "separations"
+
+    # ── Priority 2: short follow-ups inherit from last question ───────────────
+    if len(q.split()) <= 5 and history:
+        last = (history[-1].question if hasattr(history[-1], 'question') else "").lower()
+        if any(w in last for w in ["exit interview", "reason", "leaving", "would recommend"]):
+            return "exit_interviews"
+        if any(w in last for w in ["requisition", "open role", "days to fill"]):
+            return "recruiting"
+        if any(w in last for w in ["retention", "new hire", "90 day"]):
+            return "retention"
+        if any(w in last for w in ["terminat", "separat", "attrition", "turnover"]):
+            return "separations"
 
     return "headcount"
 
